@@ -1,30 +1,27 @@
 <#
-  setup-minipc-win11.ps1  — RUN AS ADMIN
-  Staged provisioning w/ fallbacks & PS5.1-only tooling
+  setup-minipc-win11.ps1  — RUN AS ADMIN (PowerShell 5.1 compatible)
+  Staged provisioning with retries, fallbacks, and user-logon resume.
 
   Stage A (normal run): optional rename + set DPI, schedule resume (user logon) and reboot if needed
-  Stage B (resume or no-reboot): wait for network, download (with retries & fallbacks), install, configure, open Chrome sign-in then CRD UI
+  Stage B (resume or no-reboot): wait for network, download (with retries & fallbacks), install, configure,
+                                 prompt for Chrome sign-in, open CRD UI, minimize Settings, keep-awake, light hardening
 #>
 
 param([switch]$Resume)
 
-# -------------------- YOUR LINKS --------------------
+# -------------------- YOUR PRIMARY LINKS --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
-$GDRIVE_MEB_ZIP  = "https://drive.google.com/file/d/19qg1MpLobyjUdFDmXnJhhdSJrM8kZ41B/view?usp=sharing"
+$GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # Machine Expert Basic EXE
 $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 
 # -------------------- PUBLIC FALLBACKS --------------------
-# Chrome (standalone installer, quiet flag works)
-$FALLBACK_CHROME_EXE = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"  # MSI is best for silent installs
-
-# Chrome Remote Desktop Host MSI
+$FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/chrome-remote-desktop/chromeremotedesktophost.msi"
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"   # adjust version if preferred
 
-# Python (OPTIONAL: update this to a specific version you like)
-$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
+# Optional central log SMB share  e.g. "\\server\provision-logs"  (leave empty to skip)
+$CentralLogShare = ""
 
-# Optional central log SMB share  e.g. "\\server\provision-logs"
-$CentralLogShare = ""   # leave empty to skip
 $TaskName = "ProvisionMiniPC_AutoResume"
 $ErrorActionPreference = 'Stop'
 
@@ -58,7 +55,7 @@ function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=3,[
   }
 }
 
-# Google Drive downloader (uses Invoke-WebRequest + session cookie)
+# Google Drive downloader (uses Invoke-WebRequest session/cookies)
 function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
   if(-not $ShareUrl){ throw "No URL supplied." }
   if($ShareUrl -match '/d/([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
@@ -89,11 +86,11 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
   Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath
 }
 
-# Downloads with multiple fallbacks (first non-empty URL that works wins)
+# Downloads with multiple fallbacks (first source that works wins)
 function Get-FromSources {
   param(
     [string]$LocalName,
-    [string[]]$Sources # ordered list of URLs (Drive or direct)
+    [string[]]$Sources
   )
   $local = Join-Path $Here $LocalName
   if (Test-Path $local) { WriteLog "Using local $local"; return $local }
@@ -159,7 +156,7 @@ if ($DesiredComputerName -and $DesiredComputerName -ne $env:COMPUTERNAME) {
 }
 
 Try-Run {
-  New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
+  New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-File $null
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 120
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "Win8DpiScaling" -Type DWord -Value 1
   $needReboot = $true
@@ -188,16 +185,16 @@ function Resume-Phase {
       if (Get-Command winget -ErrorAction SilentlyContinue) {
         winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
       } else {
-        $chrome = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_EXE)
+        $chrome = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_MSI)
         Start-Process msiexec.exe -ArgumentList "/i `"$chrome`" /qn /norestart" -Wait
       }
     } "Install Chrome"
   }
 
-  # 2) Default apps (Win11 is interactive). Open minimized.
+  # 2) Default apps (interactive on Win11) — open minimized so PS stays visible
   Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 10 } "Open Default Apps (minimized)"
 
-  # 3) Prompt to sign into Chrome (manual)
+  # 3) Chrome sign-in (manual)
   Try-Run {
     Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"
     Write-Host "`nPlease sign into Chrome as service@thetrivialcompany.com (enable sync if desired)." -ForegroundColor Yellow
@@ -222,8 +219,9 @@ function Resume-Phase {
     if (-not $did) {
       $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
       $ext = [IO.Path]::GetExtension($py).ToLower()
-      if ($ext -eq ".msi") { Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait }
-      else {
+      if ($ext -eq ".msi") {
+        Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait
+      } else {
         $ok=$false
         foreach($sw in @('/quiet InstallAllUsers=1 PrependPath=1','/quiet','/passive','/S','/VERYSILENT','/silent')){
           try{ Start-Process $py -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok=$true; break }catch{}
@@ -233,19 +231,22 @@ function Resume-Phase {
     }
   } "Install Python (winget or fallback)"
 
-  # 7) Machine Expert Basic
+  # 7) Machine Expert Basic (EXE from Drive; try common silent flags)
   Try-Run {
-    $meb = Get-FromSources -LocalName "MachineExpertBasic_V1.2_SP1.zip" -Sources @($GDRIVE_MEB_ZIP)
-    $dst = Join-Path $Here "MachineExpertBasic_Extracted"
-    if(Test-Path $dst){ Remove-Item $dst -Recurse -Force }
-    Expand-Archive -Path $meb -DestinationPath $dst -Force
-    $msi = Get-ChildItem $dst -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
-    $exe = Get-ChildItem $dst -Recurse -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'setup|install|machine|expert' } | Select-Object -First 1
-    if($msi){ Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait }
-    elseif($exe){
-      $ok=$false; foreach($sw in @('/S','/silent','/verysilent','/qn','/s')){ try{ Start-Process $exe.FullName -ArgumentList $sw -Wait -NoNewWindow; $ok=$true; break }catch{} }
-      if(-not $ok){ Write-Warning "Machine Expert installer might need interactive run." }
-    } else { throw "No installer found inside the Machine Expert ZIP." }
+    $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE)
+    if (-not (Test-Path $mebExe)) { throw "Machine Expert EXE not downloaded" }
+
+    $ok = $false
+    $flags = @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')
+    foreach ($sw in $flags) {
+      try {
+        Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop
+        $ok = $true; break
+      } catch { }
+    }
+    if (-not $ok) {
+      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try running: `"$mebExe`" /? to see supported options."
+    }
   } "Install Machine Expert Basic"
 
   # 8) Power / background policies
@@ -309,7 +310,7 @@ function Resume-Phase {
   Write-Host "`nAll installs/config complete." -ForegroundColor Green
 }
 
-# Always run resume-phase now (if we needed a reboot we already exited)
+# Always run resume-phase now (if we needed a reboot we already exited above)
 Resume-Phase
 
 WriteLog "Done: $(Get-Date)"
