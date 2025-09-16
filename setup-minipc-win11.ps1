@@ -1,15 +1,12 @@
 <#
   setup-minipc-win11.ps1  — RUN AS ADMIN (PowerShell 5.1 compatible)
-  Staged provisioning with retries, fallbacks, and user-logon resume.
-
-  Stage A (normal run): optional rename + set DPI, schedule resume (user logon) and reboot if needed
-  Stage B (resume or no-reboot): wait for network, download (with retries & fallbacks), install, configure,
-                                 prompt for Chrome sign-in, open CRD UI, minimize Settings, keep-awake, light hardening
+  Stage A: optional rename + set DPI → schedule resume & reboot if needed
+  Stage B: installs/config with retries & fallbacks, Chrome sign-in, CRD, keep-awake, light hardening
 #>
 
 param([switch]$Resume)
 
-# -------------------- YOUR PRIMARY LINKS --------------------
+# -------------------- PRIMARY LINKS --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
 $GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # Machine Expert Basic EXE
 $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
@@ -17,13 +14,16 @@ $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX8
 # -------------------- PUBLIC FALLBACKS --------------------
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/chrome-remote-desktop/chromeremotedesktophost.msi"
-$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"   # adjust version if preferred
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"   # adjust if preferred
 
-# Optional central log SMB share  e.g. "\\server\provision-logs"  (leave empty to skip)
+# Optional central SMB log share (e.g., "\\server\provision-logs"); leave empty to skip
 $CentralLogShare = ""
 
 $TaskName = "ProvisionMiniPC_AutoResume"
 $ErrorActionPreference = 'Stop'
+
+# Force TLS 1.2 for Invoke-WebRequest on fresh images
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------- Paths & logging --------------------
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -55,7 +55,7 @@ function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=3,[
   }
 }
 
-# Google Drive downloader (uses Invoke-WebRequest session/cookies)
+# Google Drive downloader (Invoke-WebRequest + cookies; NO HttpClient)
 function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
   if(-not $ShareUrl){ throw "No URL supplied." }
   if($ShareUrl -match '/d/([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
@@ -66,17 +66,20 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
   $sess = $null
   $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -SessionVariable sess
 
-  if ($r1.Headers.'Content-Type' -and $r1.Headers.'Content-Type' -notlike 'text/html*') {
+  # If not HTML, likely direct download → write to file
+  $ct = $r1.Headers['Content-Type']
+  if ($ct -and $ct -notlike 'text/html*') {
     Invoke-WebRequest -UseBasicParsing -Uri $base -WebSession $sess -OutFile $DestinationPath
     return
   }
 
-  $html = $r1.RawContent
+  # Find confirm token (HTML or cookie)
+  $html  = $r1.RawContent
   $token = $null
   if ($html -match 'confirm=([0-9A-Za-z_-]+)') { $token = $Matches[1] }
   elseif ($r1.Content -match 'name="confirm" value="([0-9A-Za-z_-]+)"') { $token = $Matches[1] }
   if (-not $token) {
-    foreach ($cookie in $sess.Cookies.GetCookies($base)) {
+    foreach ($cookie in $sess.Cookies.GetCookies([uri]$base)) {
       if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break }
     }
   }
@@ -86,7 +89,7 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
   Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath
 }
 
-# Downloads with multiple fallbacks (first source that works wins)
+# Download chain with multiple fallbacks
 function Get-FromSources {
   param(
     [string]$LocalName,
@@ -156,7 +159,7 @@ if ($DesiredComputerName -and $DesiredComputerName -ne $env:COMPUTERNAME) {
 }
 
 Try-Run {
-  New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-File $null
+  New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 120
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "Win8DpiScaling" -Type DWord -Value 1
   $needReboot = $true
@@ -245,7 +248,7 @@ function Resume-Phase {
       } catch { }
     }
     if (-not $ok) {
-      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try running: `"$mebExe`" /? to see supported options."
+      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see supported options."
     }
   } "Install Machine Expert Basic"
 
@@ -312,5 +315,5 @@ function Resume-Phase {
 
 # Always run resume-phase now (if we needed a reboot we already exited above)
 Resume-Phase
-
 WriteLog "Done: $(Get-Date)"
+
