@@ -358,13 +358,17 @@ if ($Resume) {
   Write-Host "`nAll resume-phase steps attempted. Reboot if necessary." -ForegroundColor Green
 }
 
-# If no resume and no reboot was needed, perform installs immediately (user opted not to reboot)
 if (-not $Resume -and -not $needReboot) {
   WriteLog "No reboot requested and running in immediate mode; invoking resume-phase tasks inline."
-  # Execute the same block as the Resume phase (we call the script again with -Resume)
-  # For simplicity, call the same script file with -Resume (this will run installs as current user)
-  Try-Run { & "$MyInvocation.MyCommand.Path" -Resume } "Invoke resume-phase inline"
+  $scriptPath = $PSCommandPath
+  if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+  if ($scriptPath) {
+    & $scriptPath -Resume
+  } else {
+    Write-Warning "Could not determine script path for inline resume run."
+  }
 }
+
 
 # Finalize
 WriteLog "Done: $(Get-Date)"
