@@ -1,18 +1,29 @@
 <#
   setup-minipc-win11.ps1  — RUN AS ADMIN
-  Staged provisioning:
-    - Stage A (normal run): optional rename + set DPI, schedule resume (user logon) and reboot if needed
-    - Stage B (resume or no-reboot): waits for network, downloads (with retries), installs, configures, opens CRD UI
+  Staged provisioning w/ fallbacks & PS5.1-only tooling
+
+  Stage A (normal run): optional rename + set DPI, schedule resume (user logon) and reboot if needed
+  Stage B (resume or no-reboot): wait for network, download (with retries & fallbacks), install, configure, open Chrome sign-in then CRD UI
 #>
 
 param([switch]$Resume)
 
-# -------------------- CONFIG --------------------
+# -------------------- YOUR LINKS --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
 $GDRIVE_MEB_ZIP  = "https://drive.google.com/file/d/19qg1MpLobyjUdFDmXnJhhdSJrM8kZ41B/view?usp=sharing"
 $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 
-# Optional: upload log to a share like \\server\provision-logs
+# -------------------- PUBLIC FALLBACKS --------------------
+# Chrome (standalone installer, quiet flag works)
+$FALLBACK_CHROME_EXE = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"  # MSI is best for silent installs
+
+# Chrome Remote Desktop Host MSI
+$FALLBACK_CRD_MSI    = "https://dl.google.com/chrome-remote-desktop/chromeremotedesktophost.msi"
+
+# Python (OPTIONAL: update this to a specific version you like)
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
+
+# Optional central log SMB share  e.g. "\\server\provision-logs"
 $CentralLogShare = ""   # leave empty to skip
 $TaskName = "ProvisionMiniPC_AutoResume"
 $ErrorActionPreference = 'Stop'
@@ -28,30 +39,9 @@ function Try-Run($sb, $desc){ try{ & $sb; WriteLog "OK: $desc" } catch{ WriteLog
 
 # -------------------- Admin check --------------------
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Error "Run as Administrator."; exit 1 }
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Error "Run this script as Administrator."; exit 1 }
 
-# -------------------- Scheduled task helpers --------------------
-function Create-ResumeTask {
-  param([string]$ScriptPath)
-  $escaped = $ScriptPath.Replace('"','\"')
-  $action  = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$escaped`" -Resume"
-  $user    = "$env:USERDOMAIN\$env:USERNAME"
-
-  $cmdUser = "schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
-  WriteLog "Creating resume task for user $user"
-  try { cmd.exe /c $cmdUser | Out-Null; WriteLog "Created user resume task"; return }
-  catch { WriteLog "User resume task failed: $($_.Exception.Message); trying SYSTEM" }
-
-  $cmdSys  = "schtasks /Create /RU SYSTEM /RL HIGHEST /SC ONSTART /TN `"$TaskName`" /TR `"$action`" /F"
-  cmd.exe /c $cmdSys | Out-Null
-  WriteLog "Created SYSTEM resume task (fallback)"
-}
-
-function Remove-ResumeTask {
-  try { schtasks /Delete /TN $TaskName /F | Out-Null; WriteLog "Removed resume task" } catch { WriteLog "No resume task to remove" }
-}
-
-# -------------------- Network + Download helpers --------------------
+# -------------------- Helpers (PS5.1-friendly) --------------------
 function Wait-Network([int]$TimeoutSec=120){
   $sw=[Diagnostics.Stopwatch]::StartNew()
   while($sw.Elapsed.TotalSeconds -lt $TimeoutSec){
@@ -63,41 +53,94 @@ function Wait-Network([int]$TimeoutSec=120){
 
 function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=3,[int]$DelaySec=5){
   for($i=1;$i -le $Retries;$i++){
-    try{ Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 120; WriteLog ("Downloaded {0} -> {1}" -f $Uri,$OutFile); return }
+    try{ Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 240; WriteLog ("Downloaded {0} -> {1}" -f $Uri,$OutFile); return }
     catch{ WriteLog ("Attempt {0}/{1} failed: {2}" -f $i,$Retries,$_.Exception.Message); if($i -eq $Retries){throw}; Start-Sleep $DelaySec }
   }
 }
 
+# Google Drive downloader (uses Invoke-WebRequest + session cookie)
 function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
-  if(-not $ShareUrl){ throw "No URL" }
-  if($ShareUrl -match '/d/([A-Za-z0-9_-]+)'){ $id=$Matches[1] } elseif($ShareUrl -match 'id=([A-Za-z0-9_-]+)'){ $id=$Matches[1] } else{ throw "Bad Drive URL: $ShareUrl" }
-  $base="https://docs.google.com/uc?export=download&id=$id"
-  $h=New-Object System.Net.Http.HttpClientHandler; $h.AllowAutoRedirect=$true
-  $c=New-Object System.Net.Http.HttpClient($h); $r=$c.GetAsync($base).Result
-  $ct=$null; try{$ct=$r.Content.Headers.ContentType.MediaType}catch{}
-  $html=$r.Content.ReadAsStringAsync().Result
-  if($ct -and $ct -ne "text/html"){ [IO.File]::WriteAllBytes($DestinationPath,$r.Content.ReadAsByteArrayAsync().Result); WriteLog "Drive direct -> $DestinationPath"; return }
-  $token=$null
-  if($html -match 'confirm=([0-9A-Za-z_-]+)'){ $token=$Matches[1] }
-  elseif($html -match 'name="confirm" value="([0-9A-Za-z_-]+)"'){ $token=$Matches[1] }
-  if(-not $token){
-    $jar=New-Object System.Net.CookieContainer
-    $h2=New-Object System.Net.Http.HttpClientHandler; $h2.CookieContainer=$jar; $h2.AllowAutoRedirect=$true
-    $c2=New-Object System.Net.Http.HttpClient($h2); $null=$c2.GetAsync($base).Result
-    foreach($ck in $jar.GetCookies([Uri]$base)){ if($ck.Name -like "download_warning*"){ $token=$ck.Value; break } }
+  if(-not $ShareUrl){ throw "No URL supplied." }
+  if($ShareUrl -match '/d/([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
+  elseif($ShareUrl -match 'id=([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
+  else{ throw "Couldn't parse Google Drive ID from $ShareUrl" }
+
+  $base = "https://docs.google.com/uc?export=download&id=$id"
+  $sess = $null
+  $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -SessionVariable sess
+
+  if ($r1.Headers.'Content-Type' -and $r1.Headers.'Content-Type' -notlike 'text/html*') {
+    Invoke-WebRequest -UseBasicParsing -Uri $base -WebSession $sess -OutFile $DestinationPath
+    return
   }
-  if(-not $token){ throw "Drive confirm token not found" }
-  $r2=$c.GetAsync("$base&confirm=$token").Result
-  if($r2.IsSuccessStatusCode){ [IO.File]::WriteAllBytes($DestinationPath,$r2.Content.ReadAsByteArrayAsync().Result); WriteLog "Drive confirmed -> $DestinationPath" } else{ throw "Drive download failed: $($r2.StatusCode)" }
+
+  $html = $r1.RawContent
+  $token = $null
+  if ($html -match 'confirm=([0-9A-Za-z_-]+)') { $token = $Matches[1] }
+  elseif ($r1.Content -match 'name="confirm" value="([0-9A-Za-z_-]+)"') { $token = $Matches[1] }
+  if (-not $token) {
+    foreach ($cookie in $sess.Cookies.GetCookies($base)) {
+      if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break }
+    }
+  }
+  if (-not $token) { throw "Could not obtain Drive confirm token (large file)." }
+
+  $url2 = "$base&confirm=$token"
+  Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath
 }
 
-function Get-Or-Download([string]$LocalName,[string]$Url){
-  $local=Join-Path $Here $LocalName
-  if(Test-Path $local){ WriteLog "Using local $local"; return $local }
-  $dest=Join-Path $env:TEMP $LocalName
-  if($Url -like "*drive.google.com*"){ WriteLog "Downloading $LocalName from Drive"; Download-GoogleDrive -ShareUrl $Url -DestinationPath $dest; return $dest }
-  Invoke-WebRequest-Retry -Uri $Url -OutFile $dest -Retries 3 -DelaySec 5; return $dest
+# Downloads with multiple fallbacks (first non-empty URL that works wins)
+function Get-FromSources {
+  param(
+    [string]$LocalName,
+    [string[]]$Sources # ordered list of URLs (Drive or direct)
+  )
+  $local = Join-Path $Here $LocalName
+  if (Test-Path $local) { WriteLog "Using local $local"; return $local }
+
+  $dest = Join-Path $env:TEMP $LocalName
+  foreach ($u in $Sources) {
+    if (-not $u) { continue }
+    try {
+      if ($u -like "*drive.google.com*") {
+        WriteLog "Downloading from Drive: $u"
+        Download-GoogleDrive -ShareUrl $u -DestinationPath $dest
+      } else {
+        WriteLog "Downloading: $u"
+        Invoke-WebRequest-Retry -Uri $u -OutFile $dest -Retries 3 -DelaySec 6
+      }
+      if (Test-Path $dest) { return $dest }
+    } catch {
+      WriteLog ("Source failed: {0} :: {1}" -f $u, $_.Exception.Message)
+    }
+  }
+  throw ("All sources failed for {0}" -f $LocalName)
 }
+
+# Chrome detection
+function Test-ChromeInstalled {
+  $paths=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe","$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe")
+  if($paths | Where-Object{Test-Path $_}){return $true}
+  $keys=@("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall","HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")
+  foreach($k in $keys){ $hit=Get-ChildItem $k -ErrorAction SilentlyContinue | ForEach-Object{ try{Get-ItemProperty $_.PSPath}catch{} } | Where-Object{ $_.DisplayName -like "Google Chrome*" }; if($hit){return $true} }
+  return $false
+}
+
+# Scheduled task helpers (user ONLOGON; fallback SYSTEM ONSTART)
+function Create-ResumeTask {
+  param([string]$ScriptPath)
+  $escaped = $ScriptPath.Replace('"','\"')
+  $action  = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$escaped`" -Resume"
+  $user    = "$env:USERDOMAIN\$env:USERNAME"
+  $cmdUser = "schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
+  WriteLog "Creating resume task for user $user"
+  try { cmd.exe /c $cmdUser | Out-Null; WriteLog "Created user resume task"; return }
+  catch { WriteLog "User resume task failed: $($_.Exception.Message); trying SYSTEM" }
+  $cmdSys  = "schtasks /Create /RU SYSTEM /RL HIGHEST /SC ONSTART /TN `"$TaskName`" /TR `"$action`" /F"
+  cmd.exe /c $cmdSys | Out-Null
+  WriteLog "Created SYSTEM resume task (fallback)"
+}
+function Remove-ResumeTask { try{ schtasks /Delete /TN $TaskName /F | Out-Null; WriteLog "Removed resume task" }catch{ WriteLog "No resume task to remove" } }
 
 # -------------------- Light hardening --------------------
 Try-Run {
@@ -115,7 +158,6 @@ if ($DesiredComputerName -and $DesiredComputerName -ne $env:COMPUTERNAME) {
   $needReboot = $true
 }
 
-# Set DPI to 125% for current user (requires sign-out/reboot to fully apply)
 Try-Run {
   New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 120
@@ -125,7 +167,7 @@ Try-Run {
 
 if (-not $Resume -and $needReboot) {
   $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
-Try-Run { Create-ResumeTask -ScriptPath $scriptPath } "Create resume task"
+  Try-Run { Create-ResumeTask -ScriptPath $scriptPath } "Create resume task"
   Write-Host "Rebooting now to apply rename/DPI. Script will auto-resume after you log in." -ForegroundColor Yellow
   WriteLog "Rebooting for rename/DPI"
   Restart-Computer -Force
@@ -138,59 +180,65 @@ function Resume-Phase {
   WriteLog "Resume phase start. Waiting for network..."
   if (-not (Wait-Network -TimeoutSec 120)) { Write-Warning "Network not ready after wait; continuing." }
 
-  # Chrome (skip if present)
-  function Test-ChromeInstalled {
-    $paths=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe","$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe")
-    if($paths | Where-Object{Test-Path $_}){return $true}
-    $keys=@("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall","HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")
-    foreach($k in $keys){ $hit=Get-ChildItem $k -ErrorAction SilentlyContinue | ForEach-Object{ try{Get-ItemProperty $_.PSPath}catch{} } | Where-Object{ $_.DisplayName -like "Google Chrome*" }; if($hit){return $true} }
-    return $false
-  }
-  if (Test-ChromeInstalled) { WriteLog "Chrome present; skip" }
-  else {
+  # 1) Chrome
+  if (Test-ChromeInstalled) {
+    WriteLog "Chrome present; skip install"
+  } else {
     Try-Run {
       if (Get-Command winget -ErrorAction SilentlyContinue) {
         winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
-      } else { Write-Warning "winget not found; provide Chrome MSI locally." }
+      } else {
+        $chrome = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_EXE)
+        Start-Process msiexec.exe -ArgumentList "/i `"$chrome`" /qn /norestart" -Wait
+      }
     } "Install Chrome"
   }
 
-  # Optional: default browser (interactive on Win11)
-  $DefaultAppXml = Join-Path $Here "DefaultAppAssociations.xml"
-  if (Test-Path $DefaultAppXml) { Try-Run { Dism /Online /Import-DefaultAppAssociations:$DefaultAppXml | Out-Null } "Import default apps XML" }
-  else { Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome"; Start-Sleep 12 } "Open Default Apps (interactive)" }
+  # 2) Default apps (Win11 is interactive). Open minimized.
+  Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 10 } "Open Default Apps (minimized)"
 
-  # CRD host
+  # 3) Prompt to sign into Chrome (manual)
   Try-Run {
-    $crdMsi = Get-Or-Download -LocalName "chromeremotedesktophost.msi" -Url $GDRIVE_CRD_MSI
-    Start-Process msiexec.exe -ArgumentList "/i `"$crdMsi`" /qn /norestart" -Wait
+    Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"
+    Write-Host "`nPlease sign into Chrome as service@thetrivialcompany.com (enable sync if desired)." -ForegroundColor Yellow
+    Read-Host "Press Enter here after you’ve finished signing in"
+  } "Chrome account sign-in (manual)"
+
+  # 4) Chrome Remote Desktop Host
+  Try-Run {
+    $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI)
+    Start-Process msiexec.exe -ArgumentList "/i `"$crd`" /qn /norestart" -Wait
   } "Install Chrome Remote Desktop Host"
 
-  # .NET 3.5
+  # 5) .NET 3.5 (if needed)
   Try-Run { DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /Quiet /NoRestart | Out-Null } ".NET 3.5"
 
-  # Python
+  # 6) Python
   Try-Run {
-    $py = Get-Or-Download -LocalName "python_installer.exe" -Url $GDRIVE_PY_EXE
-    if (Test-Path $py) {
-      if ([IO.Path]::GetExtension($py).ToLower() -eq ".msi") {
-        Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait
-      } else {
+    $did = $false
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+      try { winget install --id Python.Python.3 --silent --accept-source-agreements --accept-package-agreements | Out-Null; $did=$true } catch {}
+    }
+    if (-not $did) {
+      $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
+      $ext = [IO.Path]::GetExtension($py).ToLower()
+      if ($ext -eq ".msi") { Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait }
+      else {
         $ok=$false
         foreach($sw in @('/quiet InstallAllUsers=1 PrependPath=1','/quiet','/passive','/S','/VERYSILENT','/silent')){
           try{ Start-Process $py -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok=$true; break }catch{}
         }
-        if(-not $ok){ Write-Warning "Python installer may need interactive run; check its silent flags." }
+        if(-not $ok){ Write-Warning "Python installer may need interactive run; check flags." }
       }
     }
-  } "Install Python (best-effort)"
+  } "Install Python (winget or fallback)"
 
-  # Machine Expert Basic
+  # 7) Machine Expert Basic
   Try-Run {
-    $zip = Get-Or-Download -LocalName "MachineExpertBasic_V1.2_SP1.zip" -Url $GDRIVE_MEB_ZIP
+    $meb = Get-FromSources -LocalName "MachineExpertBasic_V1.2_SP1.zip" -Sources @($GDRIVE_MEB_ZIP)
     $dst = Join-Path $Here "MachineExpertBasic_Extracted"
     if(Test-Path $dst){ Remove-Item $dst -Recurse -Force }
-    Expand-Archive -Path $zip -DestinationPath $dst -Force
+    Expand-Archive -Path $meb -DestinationPath $dst -Force
     $msi = Get-ChildItem $dst -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
     $exe = Get-ChildItem $dst -Recurse -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'setup|install|machine|expert' } | Select-Object -First 1
     if($msi){ Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait }
@@ -200,7 +248,7 @@ function Resume-Phase {
     } else { throw "No installer found inside the Machine Expert ZIP." }
   } "Install Machine Expert Basic"
 
-  # Power + background noise
+  # 8) Power / background policies
   Try-Run {
     powercfg /HIBERNATE OFF
     powercfg -Change -standby-timeout-ac 0
@@ -230,7 +278,7 @@ function Resume-Phase {
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSync" -Type DWord -Value 1
   } "Reduce background activity"
 
-  # Firewall for CRD
+  # 9) Firewall for CRD
   Try-Run {
     $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
     if(Test-Path $hostExe){
@@ -239,7 +287,7 @@ function Resume-Phase {
     }
   } "Firewall rules for CRD"
 
-  # Open CRD activation UI
+  # 10) Open CRD activation UI
   Try-Run { Start-Process "chrome.exe" "https://remotedesktop.google.com/access" } "Open CRD activation page"
 
   # Optional: upload log
@@ -261,7 +309,7 @@ function Resume-Phase {
   Write-Host "`nAll installs/config complete." -ForegroundColor Green
 }
 
-# Always run resume-phase now (if we needed a reboot we already exited above)
+# Always run resume-phase now (if we needed a reboot we already exited)
 Resume-Phase
 
 WriteLog "Done: $(Get-Date)"
