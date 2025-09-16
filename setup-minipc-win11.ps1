@@ -124,7 +124,8 @@ Try-Run {
 } "Set DPI to 125%"
 
 if (-not $Resume -and $needReboot) {
-  Try-Run { Create-ResumeTask -ScriptPath ($PSCommandPath ?? $MyInvocation.MyCommand.Path) } "Create resume task"
+  $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+Try-Run { Create-ResumeTask -ScriptPath $scriptPath } "Create resume task"
   Write-Host "Rebooting now to apply rename/DPI. Script will auto-resume after you log in." -ForegroundColor Yellow
   WriteLog "Rebooting for rename/DPI"
   Restart-Computer -Force
