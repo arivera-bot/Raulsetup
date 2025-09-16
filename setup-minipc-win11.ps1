@@ -26,11 +26,18 @@ $TaskName = "ProvisionMiniPC_AutoResume"
 
 $ErrorActionPreference = 'Stop'
 
+# Paths & logging (define early so functions can use $Log)
+$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Here) { $Here = $env:TEMP }   # fallback when run from pipeline
+$Log = Join-Path $Here "setup-mini-pc.log"
+"=== Run: $(Get-Date) on $env:COMPUTERNAME (Resume=$Resume) ===" | Out-File $Log -Append -Encoding utf8
+
 # -------------------- Guards & helpers --------------------
 function WriteLog($m){ $m | Out-File -FilePath $Log -Append -Encoding utf8 }
+
 function Try-Run($scriptBlock, $desc) {
   try { & $scriptBlock; WriteLog "OK: $desc" }
-  catch { WriteLog "ERR: $desc :: $($_.Exception.Message)"; Write-Warning "Failed: $desc -> $($_.Exception.Message)" }
+  catch { WriteLog ("ERR: {0} :: {1}" -f $desc, $_.Exception.Message); Write-Warning "Failed: $desc -> $($_.Exception.Message)" }
 }
 
 # Admin required
@@ -39,12 +46,6 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   Write-Error "Please run this script as Administrator."
   exit 1
 }
-
-# Paths & logging
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $Here) { $Here = $env:TEMP }   # fallback when run from pipeline
-$Log = Join-Path $Here "setup-mini-pc.log"
-"=== Run: $(Get-Date) on $env:COMPUTERNAME (Resume=$Resume) ===" | Out-File $Log -Append -Encoding utf8
 
 # Small helper to create scheduled task to call this script with -Resume
 function Create-ResumeTask {
@@ -73,7 +74,6 @@ function Download-GoogleDrive {
   $baseUri = "https://docs.google.com/uc?export=download&id=$id"
 
   # First request
-  $wc = New-Object System.Net.Http.HttpClient
   $handler = New-Object System.Net.Http.HttpClientHandler
   $handler.AllowAutoRedirect = $true
   $client = New-Object System.Net.Http.HttpClient($handler)
@@ -169,7 +169,7 @@ if (Test-ChromeInstalled) {
   Try-Run {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
       winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
-    } else { WriteWarning "winget not found; provide Chrome MSI locally." }
+    } else { Write-Warning "winget not found; provide Chrome MSI locally." }
   } "Install Chrome"
 }
 
@@ -199,7 +199,7 @@ Try-Run {
       foreach ($sw in @('/quiet InstallAllUsers=1 PrependPath=1','/quiet','/passive','/S','/VERYSILENT','/silent')) {
         try { Start-Process -FilePath $pyExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $installed=$true; break } catch {}
       }
-      if (-not $installed) { WriteWarning "Python installer may need interactive run; check installer flags." }
+      if (-not $installed) { Write-Warning "Python installer may need interactive run; check installer flags." }
     }
   }
 } "Install Python (best-effort)"
@@ -218,7 +218,7 @@ Try-Run {
     foreach ($sw in @('/S','/silent','/verysilent','/qn','/s')) {
       try { Start-Process $exe.FullName -ArgumentList $sw -Wait -NoNewWindow; $installed=$true; break } catch {}
     }
-    if (-not $installed) { WriteWarning "Machine Expert installer might need interactive run." }
+    if (-not $installed) { Write-Warning "Machine Expert installer might need interactive run." }
   } else { throw "No installer found inside Machine Expert ZIP." }
 } "Install Machine Expert Basic"
 
@@ -293,10 +293,11 @@ if ($CentralLogShare -and ($CentralLogShare -ne "")) {
     $host = (Get-WmiObject Win32_ComputerSystem).Name
     $dstDir = Join-Path $CentralLogShare $host
     if (-not (Test-Path $dstDir)) { New-Item -Path $dstDir -ItemType Directory -Force | Out-Null }
-    Copy-Item -Path $Log -Destination (Join-Path $dstDir ("setup-mini-pc_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")) -Force
-    WriteLog "Uploaded log to $dstDir"
+    $destFile = Join-Path $dstDir ("setup-mini-pc_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
+    Copy-Item -Path $Log -Destination $destFile -Force
+    WriteLog ("Uploaded log to {0}" -f $dstDir)
   } catch {
-    WriteLog "Failed to upload log to $CentralLogShare: $($_.Exception.Message)"
+    WriteLog ("Failed to upload log to {0}: {1}" -f $CentralLogShare, $_.Exception.Message)
   }
 }
 
