@@ -1,56 +1,143 @@
-<# setup-mini-pc.ps1
-   Run as Administrator.
-   - Prompts for computer name (optional)
-   - Adds Defender exclusion for the folder it runs from
-   - Installs Chrome (if missing)
-   - Installs Chrome Remote Desktop Host (MSI)
-   - Installs Machine Expert Basic (ZIP -> installer)
-   - Sets display scale to 125%, disables sleep/hibernate, trims background noise
-   - Launches Chrome to https://remotedesktop.google.com/access for interactive activation
-   - Optionally removes Defender exclusion at the end (uncomment cleanup)
+<#
+  setup-mini-pc.ps1
+  Run as Administrator.
+
+  What it does (summary)
+  - Adds Defender exclusion for the folder the script lives in
+  - Prompts you for computer name (optional) and renames machine (reboot required)
+  - Downloads CRD MSI, Python EXE, MachineExpert ZIP from Google Drive links you provided
+    (handles Drive's "large file" confirmation flow)
+  - Installs Python (best-effort silent), CRD Host (msiexec /qn), and Machine Expert (silent best-effort)
+  - Enables .NET 3.5 (DISM)
+  - Sets display scale to 125% (requires sign-out/reboot)
+  - Keeps the system awake, disables hibernate
+  - Adds firewall rules for CRD host if present
+  - Opens Chrome to remotedesktop.google.com/access for interactive CRD activation
+  - Leaves Defender exclusions in place (optional cleanup commented out)
 #>
 
-# ===== CONFIG - edit these before publishing =====
-$URL_CRD_MSI = "https://raw.githubusercontent.com/YOURORG/YOURREPO/main/installers/chromeremotedesktophost.msi"
-$URL_MEB_ZIP = "https://raw.githubusercontent.com/YOURORG/YOURREPO/main/installers/MachineExpertBasic_V1.2_SP1.zip"
-# ==================================================
+# ---------- CONFIG: Google Drive share URLs you gave ----------
+$GDRIVE_PY_EXE = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
+$GDRIVE_MEB_ZIP = "https://drive.google.com/file/d/19qg1MpLobyjUdFDmXnJhhdSJrM8kZ41B/view?usp=sharing"
+$GDRIVE_CRD_MSI = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
+# ---------------------------------------------------------------
 
 $ErrorActionPreference = 'Stop'
 
-# --- Admin guard ---
+# ---- Admin guard ----
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "Please run this script as Administrator." -ForegroundColor Yellow
-    exit 1
+  Write-Host "Please run this script as Administrator." -ForegroundColor Yellow
+  exit 1
 }
 
-# --- Helpers & logging ---
+# ---- Helpers & logging ----
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Log  = Join-Path $Here "setup-mini-pc.log"
+if (-not $Here) { $Here = $env:TEMP }   # fallback if run from pipeline
+$Log = Join-Path $Here "setup-mini-pc.log"
 "=== Run: $(Get-Date) on $env:COMPUTERNAME ===" | Out-File $Log -Append -Encoding utf8
-
 function Log($m){ $m | Out-File $Log -Append }
 function Try-Run($scriptBlock, $desc) {
   try { & $scriptBlock; Log "OK: $desc" }
   catch { Log "ERR: $desc :: $($_.Exception.Message)"; Write-Warning "Failed: $desc -> $($_.Exception.Message)" }
 }
 
-# --- Defender exclusion for provisioning folder & powershell process ---
+# ---- Google Drive downloader (handles confirm token for large files) ----
+function Download-GoogleDrive {
+  param(
+    [string]$ShareUrl,
+    [string]$DestinationPath
+  )
+
+  # Extract file id from many possible Drive URL formats
+  $id = $null
+  if ($ShareUrl -match '/d/([A-Za-z0-9_-]+)') { $id = $Matches[1] }
+  elseif ($ShareUrl -match 'id=([A-Za-z0-9_-]+)') { $id = $Matches[1] }
+  else { throw "Couldn't parse Google Drive file id from URL: $ShareUrl" }
+
+  $baseUri = "https://docs.google.com/uc?export=download&id=$id"
+  $wc = New-Object System.Net.Http.HttpClient
+  $handler = New-Object System.Net.Http.HttpClientHandler
+  $handler.AllowAutoRedirect = $true
+  $client = New-Object System.Net.Http.HttpClient($handler)
+
+  # first request - may return an HTML page with a confirmation token for large files
+  $resp1 = $client.GetAsync($baseUri).Result
+  $contentType = $resp1.Content.Headers.ContentType.MediaType
+  $content = $resp1.Content.ReadAsStringAsync().Result
+
+  # If response is the file (content-type != html), write it directly
+  if ($contentType -ne "text/html") {
+    [IO.File]::WriteAllBytes($DestinationPath, $resp1.Content.ReadAsByteArrayAsync().Result)
+    return
+  }
+
+  # otherwise try to find confirm token in the HTML
+  # look for confirm=TOKEN in any hrefs/inputs or the cookie name download_warning_{id}
+  $token = $null
+  if ($content -match 'confirm=([0-9A-Za-z_-]+)') { $token = $Matches[1] }
+  elseif ($content -match 'name="confirm" value="([0-9A-Za-z_-]+)"') { $token = $Matches[1] }
+
+  if (-not $token) {
+    # try to read cookies; sometimes Google sends a download_warning cookie
+    $cookieContainer = New-Object System.Net.CookieContainer
+    $handler2 = New-Object System.Net.Http.HttpClientHandler
+    $handler2.CookieContainer = $cookieContainer
+    $handler2.AllowAutoRedirect = $true
+    $client2 = New-Object System.Net.Http.HttpClient($handler2)
+    $respTemp = $client2.GetAsync($baseUri).Result
+    foreach ($cookie in $cookieContainer.GetCookies([Uri] $baseUri)) {
+      if ($cookie.Name -like "download_warning*") { $token = $cookie.Value; break }
+    }
+  }
+
+  if (-not $token) {
+    throw "Could not obtain Google Drive confirmation token. Manual download may be required."
+  }
+
+  # request again with confirm token
+  $uri2 = "$baseUri&confirm=$token"
+  $resp2 = $client.GetAsync($uri2).Result
+  if ($resp2.IsSuccessStatusCode) {
+    [IO.File]::WriteAllBytes($DestinationPath, $resp2.Content.ReadAsByteArrayAsync().Result)
+  } else {
+    throw "Download failed from Google Drive (status code $($resp2.StatusCode))."
+  }
+}
+
+# ---- Download helper that understands local vs Drive vs http(s) ----
+function Get-Or-Download {
+  param([string]$LocalName, [string]$Url)
+  $local = Join-Path $Here $LocalName
+  if (Test-Path $local) { return $local }
+
+  $dest = Join-Path $env:TEMP $LocalName
+
+  if ($Url -like "*drive.google.com*") {
+    Write-Host "Downloading from Google Drive: $LocalName ..."
+    Download-GoogleDrive -ShareUrl $Url -DestinationPath $dest
+    return $dest
+  } else {
+    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $dest
+    return $dest
+  }
+}
+
+# ---- Defender exclusions for provisioning folder + powershell process ----
 $ProvisionDir = $Here
 Try-Run {
-  # Add exclusions to avoid false-positive blocking during provisioning
   Add-MpPreference -ExclusionPath $ProvisionDir -ErrorAction SilentlyContinue
   Add-MpPreference -ExclusionProcess "powershell.exe" -ErrorAction SilentlyContinue
   Write-Host "Added Defender exclusions for $ProvisionDir and powershell.exe" -ForegroundColor Cyan
 } "Defender exclusions (provision folder + PowerShell)"
 
-# --- Prompt for desired computer name (optional) ---
+# ---- Prompt for computer name (optional) ----
 $DesiredComputerName = Read-Host "Enter computer name (leave blank to keep current: $env:COMPUTERNAME)"
 if ($DesiredComputerName -and $DesiredComputerName -ne $env:COMPUTERNAME) {
   Try-Run { Rename-Computer -NewName $DesiredComputerName -Force } "Rename computer to '$DesiredComputerName' (reboot required)"
 }
 
-# --- Chrome detection function ---
+# ---- Chrome detection (skip install if present) ----
 function Test-ChromeInstalled {
   $candidates = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
                   "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe")
@@ -66,17 +153,6 @@ function Test-ChromeInstalled {
   return $false
 }
 
-# --- Download helper (prefer local copy, otherwise download from URL) ---
-function Get-Or-Download {
-  param([string]$LocalName, [string]$Url)
-  $local = Join-Path $Here $LocalName
-  if (Test-Path $local) { return $local }
-  $dest = Join-Path $env:TEMP $LocalName
-  Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $dest
-  return $dest
-}
-
-# --- Install Chrome if missing ---
 if (Test-ChromeInstalled) {
   Write-Host "Chrome present — skipping install." -ForegroundColor Cyan
   Log "Skip: Chrome already installed"
@@ -84,30 +160,60 @@ if (Test-ChromeInstalled) {
   Try-Run {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
       winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
-    } else { throw "winget not found; install Chrome manually or provide MSI locally." }
+    } else {
+      Write-Warning "winget not found; please install Chrome manually or provide an MSI in the script folder."
+    }
   } "Install Google Chrome"
 }
 
-# --- Best-effort: make Chrome default (won't be fully silent on Win11) ---
+# ---- Best-effort: make Chrome default (interactive on Win11) ----
 $DefaultAppXml = Join-Path $Here "DefaultAppAssociations.xml"
 if (Test-Path $DefaultAppXml) {
-  Try-Run { Dism /Online /Import-DefaultAppAssociations:$DefaultAppXml | Out-Null } "Import Default App Associations XML (affects new users)"
+  Try-Run { Dism /Online /Import-DefaultAppAssociations:$DefaultAppXml | Out-Null } "Import Default App Associations XML"
 } else {
   Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome"; Start-Sleep 20 } "Open Settings for 'Make default' (click manually)"
 }
 
-# --- Install Chrome Remote Desktop Host (MSI) ---
+# ---- Download & install CRD MSI from your Drive link ----
 Try-Run {
-  $crdMsi = Get-Or-Download -LocalName "chromeremotedesktophost.msi" -Url $URL_CRD_MSI
-  Start-Process msiexec.exe -ArgumentList "/i `"$crdMsi`" /qn /norestart" -Wait
+  $crdMsiPath = Get-Or-Download -LocalName "chromeremotedesktophost.msi" -Url $GDRIVE_CRD_MSI
+  Start-Process msiexec.exe -ArgumentList "/i `"$crdMsiPath`" /qn /norestart" -Wait
 } "Install Chrome Remote Desktop Host"
 
-# --- Enable .NET 3.5 (if needed by installers) ---
+# ---- Enable .NET 3.5 (may be needed) ----
 Try-Run { DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /Quiet /NoRestart | Out-Null } ".NET Framework 3.5"
 
-# --- Install Machine Expert Basic (ZIP -> silent install best-effort) ---
+# ---- Download & install Python EXE (best-effort silent) ----
 Try-Run {
-  $mebZip = Get-Or-Download -LocalName "MachineExpertBasic_V1.2_SP1.zip" -Url $URL_MEB_ZIP
+  $pyExe = Get-Or-Download -LocalName "python_installer.exe" -Url $GDRIVE_PY_EXE
+  if ($pyExe -and (Test-Path $pyExe)) {
+    $ext = [IO.Path]::GetExtension($pyExe).ToLower()
+    if ($ext -eq ".msi") {
+      Start-Process msiexec.exe -ArgumentList "/i `"$pyExe`" /qn /norestart" -Wait
+    } else {
+      # Try common Python installer silent args (InstallAllUsers=1 PrependPath=1 /quiet)
+      $tried = $false
+      Try {
+        Start-Process -FilePath $pyExe -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait -ErrorAction Stop
+        $tried = $true
+      } catch {}
+      if (-not $tried) {
+        foreach ($sw in @('/quiet','/passive','/S','/VERYSILENT','/silent')) {
+          try {
+            Start-Process -FilePath $pyExe -ArgumentList $sw -Wait -ErrorAction Stop
+            $tried = $true
+            break
+          } catch {}
+        }
+      }
+      if (-not $tried) { Write-Warning "Python installer ran but we couldn't confirm silent install. You may need to run interactively." }
+    }
+  }
+} "Install Python (best-effort silent)"
+
+# ---- Download & install Machine Expert Basic ----
+Try-Run {
+  $mebZip = Get-Or-Download -LocalName "MachineExpertBasic_V1.2_SP1.zip" -Url $GDRIVE_MEB_ZIP
   $dst = Join-Path $Here "MachineExpertBasic_Extracted"
   if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
   Expand-Archive -Path $mebZip -DestinationPath $dst -Force
@@ -116,20 +222,22 @@ Try-Run {
   if ($msi) {
     Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait
   } elseif ($exe) {
+    $installed = $false
     foreach ($sw in @('/S','/silent','/verysilent','/qn','/s')) {
-      try { Start-Process $exe.FullName -ArgumentList $sw -Wait -NoNewWindow; break } catch {}
+      try { Start-Process $exe.FullName -ArgumentList $sw -Wait -NoNewWindow; $installed = $true; break } catch {}
     }
-  } else { throw "No installer found inside ZIP." }
+    if (-not $installed) { Write-Warning "Couldn't run Machine Expert installer silently; try running interactively once to confirm flags." }
+  } else { throw "No installer found inside the expanded Machine Expert ZIP." }
 } "Install Machine Expert Basic"
 
-# --- Set display scale to 125% (DPI=120) for current user (sign-out/reboot required to fully apply) ---
+# ---- Set display scale to 125% (DPI=120) for current user (needs sign-out/reboot) ----
 Try-Run {
   New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 120
   Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "Win8DpiScaling" -Type DWord -Value 1
 } "Set display scale to 125%"
 
-# --- Keep system awake / disable hibernate / no screen off on AC ---
+# ---- Keep system awake / disable hibernate ----
 Try-Run {
   powercfg /HIBERNATE OFF
   powercfg -Change -standby-timeout-ac 0
@@ -141,7 +249,7 @@ Try-Run {
   powercfg -SetActive SCHEME_CURRENT
 } "Keep system awake (AC)"
 
-# --- Reduce background noise (safe policies) ---
+# ---- Reduce background noise (safe policies) ----
 Try-Run {
   New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Force | Out-Null
   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Type DWord -Value 1
@@ -160,7 +268,7 @@ Try-Run {
   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSync" -Type DWord -Value 1
 } "Reduce background activity"
 
-# --- Firewall rules for CRD (if present) ---
+# ---- Firewall rules for CRD (if present) ----
 Try-Run {
   $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
   if (Test-Path $hostExe) {
@@ -169,14 +277,14 @@ Try-Run {
   }
 } "Firewall rules for CRD"
 
-# --- Launch CRD activation page (interactive 'Turn on' - sign into Chrome as service@thetrivialcompany.com) ---
-Write-Host "`nOpening Chrome to Chrome Remote Desktop. Sign into Chrome as service@thetrivialcompany.com, click 'Turn on', confirm name and enter PIN (e.g. 748447)." -ForegroundColor Green
+# ---- Launch CRD activation page (interactive 'Turn on') ----
+Write-Host "`nOpening Chrome to Chrome Remote Desktop. Sign into Chrome as service@thetrivialcompany.com, click 'Turn on', confirm name, and set PIN (e.g., 748447)." -ForegroundColor Green
 Try-Run { Start-Process "chrome.exe" "https://remotedesktop.google.com/access" } "Open CRD activation page"
 
-Write-Host "`nAll steps attempted. If you renamed the PC or changed DPI, reboot to finalize." -ForegroundColor Green
+Write-Host "`nAll steps attempted. Reboot to apply rename/DPI changes." -ForegroundColor Green
 Log "Done: $(Get-Date)"
 
-# --- OPTIONAL cleanup: remove Defender exclusions (uncomment to enable) ---
+ ---- OPTIONAL cleanup: remove Defender exclusions (uncomment to enable) ----
  Try-Run {
    Remove-MpPreference -ExclusionPath $ProvisionDir -ErrorAction SilentlyContinue
    Remove-MpPreference -ExclusionProcess "powershell.exe" -ErrorAction SilentlyContinue
