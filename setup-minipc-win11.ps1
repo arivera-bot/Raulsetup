@@ -3,19 +3,20 @@
 
   Stage A: optional rename + set DPI → schedule resume & reboot if needed
   Stage B: installs/config with retries & fallbacks, Chrome sign-in, CRD, keep-awake, light hardening
+  Manual fallback: if a download fails, Chrome opens to the installer URL and the script waits for you to finish.
 #>
 
 param([switch]$Resume)
 
-# -------------------- PRIMARY LINKS --------------------
+# -------------------- PRIMARY LINKS (YOUR DRIVE LINKS) --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
-$GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # Machine Expert Basic EXE (~479 MB)
+$GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # ~479 MB
 $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 
 # -------------------- PUBLIC FALLBACKS --------------------
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/chrome-remote-desktop/chromeremotedesktophost.msi"
-$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"   # adjust if preferred
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 
 # Optional central SMB log share (e.g., "\\server\provision-logs"); leave empty to skip
 $CentralLogShare = ""
@@ -64,7 +65,7 @@ function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=4,[
   }
 }
 
-# --- File validation helpers ---
+# --- Validation helpers ---
 function Test-InstallerMagic {
   param([string]$Path)
   if (-not (Test-Path $Path)) { return $false }
@@ -74,15 +75,8 @@ function Test-InstallerMagic {
     $bytes = $br.ReadBytes(8)
     $br.Dispose(); $fs.Dispose()
     if ($bytes.Length -lt 2) { return $false }
-
-    # PE .exe: starts with 'MZ'
-    if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) { return $true }
-
-    # MSI (OLE Compound File): D0 CF 11 E0 A1 B1 1A E1
-    if ($bytes.Length -ge 8 -and $bytes[0] -eq 0xD0 -and $bytes[1] -eq 0xCF -and
-        $bytes[2] -eq 0x11 -and $bytes[3] -eq 0xE0 -and
-        $bytes[4] -eq 0xA1 -and $bytes[5] -eq 0xB1 -and
-        $bytes[6] -eq 0x1A -and $bytes[7] -eq 0xE1) { return $true }
+    if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) { return $true } # EXE MZ
+    if ($bytes.Length -ge 8 -and $bytes[0] -eq 0xD0 -and $bytes[1] -eq 0xCF -and $bytes[2] -eq 0x11 -and $bytes[3] -eq 0xE0 -and $bytes[4] -eq 0xA1 -and $bytes[5] -eq 0xB1 -and $bytes[6] -eq 0x1A -and $bytes[7] -eq 0xE1){ return $true } # MSI OLE
   } catch { }
   return $false
 }
@@ -93,27 +87,23 @@ function Test-NotHtml {
   try {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     if ($bytes.Length -lt 32) { return $false }
-    # Quick scan for HTML signatures in the first ~2KB
     $sliceLen = [Math]::Min(2048, $bytes.Length)
     $text = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $sliceLen)
-    if ($text -match '<\!DOCTYPE\s+html' -or $text -match '<html' -or $text -match 'Google Drive' -or $text -match 'quota exceeded' -or $text -match 'Sign in') {
-      return $false
-    }
+    if ($text -match '<\!DOCTYPE\s+html' -or $text -match '<html' -or $text -match 'Google Drive' -or $text -match 'quota exceeded' -or $text -match 'Sign in') { return $false }
     return $true
   } catch { return $false }
 }
 
-# Google Drive downloader (confirm-token + validate content)
+# Google Drive downloader (confirm-token + content validation)
 function Download-GoogleDrive {
   param(
     [string]$ShareUrl,
     [string]$DestinationPath,
-    [int]$TimeoutSec = 3600,      # generous for big files
+    [int]$TimeoutSec = 3600,
     [int]$MinBytes   = 1MB
   )
   if (-not $ShareUrl) { throw "No URL supplied." }
 
-  # Extract Drive file ID
   $id = $null
   if ($ShareUrl -match '/d/([A-Za-z0-9_-]+)') { $id = $Matches[1] }
   elseif ($ShareUrl -match 'id=([A-Za-z0-9_-]+)') { $id = $Matches[1] }
@@ -128,40 +118,30 @@ function Download-GoogleDrive {
     'Accept'     = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
   }
 
-  # First request
   $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -Headers $headers -SessionVariable sess -TimeoutSec $TimeoutSec
 
   if ($r1.Headers['Content-Type'] -and $r1.Headers['Content-Type'] -notlike 'text/html*') {
     Invoke-WebRequest -UseBasicParsing -Uri $base -WebSession $sess -OutFile $DestinationPath -Headers $headers -TimeoutSec $TimeoutSec
   } else {
-    # Find confirm token (cookie or HTML)
     $token = $null
-
-    foreach ($cookie in $sess.Cookies.GetCookies([Uri]$base)) {
-      if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break }
-    }
-
+    foreach ($cookie in $sess.Cookies.GetCookies([Uri]$base)) { if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break } }
     if (-not $token) {
       $html = $r1.Content
-      if     ($html -match 'confirm=([0-9A-Za-z_-]+)')                     { $token = $Matches[1] }
-      elseif ($html -match 'name="confirm"\s+value="([0-9A-Za-z_-]+)"')    { $token = $Matches[1] }
-      elseif ($html -match 'href="[^"]*?confirm=([0-9A-Za-z_-]+)[^"]*"')   { $token = $Matches[1] }
+      if     ($html -match 'confirm=([0-9A-Za-z_-]+)')                   { $token = $Matches[1] }
+      elseif ($html -match 'name="confirm"\s+value="([0-9A-Za-z_-]+)"')  { $token = $Matches[1] }
+      elseif ($html -match 'href="[^"]*?confirm=([0-9A-Za-z_-]+)[^"]*"') { $token = $Matches[1] }
     }
-
-    if (-not $token) { throw "Could not obtain Drive confirm token (large file page or permissions not public)." }
-
+    if (-not $token) { throw "Could not obtain Drive confirm token (large file flow or permissions not public)." }
     $dlUrl = "$base&confirm=$token"
     Invoke-WebRequest -UseBasicParsing -Uri $dlUrl -WebSession $sess -OutFile $DestinationPath -Headers $headers -TimeoutSec $TimeoutSec
   }
 
-  # Validate result: size, not HTML, and EXE/MSI magic bytes
   if (-not (Test-Path $DestinationPath)) { throw "Download failed (no file)." }
   $len = (Get-Item $DestinationPath).Length
   if ($len -lt $MinBytes) { throw "Download too small ($len bytes) - likely an error page." }
   if (-not (Test-NotHtml -Path $DestinationPath)) { throw "Downloaded HTML/error page instead of the binary (check sharing/quota)." }
   if (-not (Test-InstallerMagic -Path $DestinationPath)) { throw "Downloaded file is not a valid EXE/MSI (magic bytes mismatch)." }
 
-  # Size stabilization loop
   $stableCount=0; $lastSize=-1
   while($stableCount -lt 3){
     if(-not (Test-Path $DestinationPath)){ Start-Sleep 2; continue }
@@ -180,8 +160,7 @@ function Get-FromSources {
   )
   $local = Join-Path $Here $LocalName
   if (Test-Path $local -and (Get-Item $local).Length -ge $MinBytes -and (Test-NotHtml $local) -and (Test-InstallerMagic $local)) {
-    WriteLog "Using local $local"
-    return $local
+    WriteLog "Using local $local"; return $local
   }
 
   $dest = Join-Path $env:TEMP $LocalName
@@ -189,7 +168,6 @@ function Get-FromSources {
     if (-not $u) { continue }
     try {
       if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
-
       if ($u -like "*drive.google.com*") {
         WriteLog "Downloading from Drive: $u"
         Download-GoogleDrive -ShareUrl $u -DestinationPath $dest -TimeoutSec 3600 -MinBytes $MinBytes
@@ -200,7 +178,6 @@ function Get-FromSources {
         if (-not (Test-NotHtml $dest)) { throw "Looks like HTML, not an installer." }
         if (-not (Test-InstallerMagic $dest)) { throw "Not a valid EXE/MSI (magic mismatch)." }
       }
-
       WriteLog ("Downloaded to {0} ({1:N0} bytes)" -f $dest, (Get-Item $dest).Length)
       return $dest
     } catch {
@@ -208,6 +185,33 @@ function Get-FromSources {
     }
   }
   throw ("All sources failed for {0} (size/magic/html checks failed or downloads unavailable)" -f $LocalName)
+}
+
+# Manual download / install helper (final fallback)
+function Open-ManualAndWait {
+  param(
+    [string]$Url,
+    [string]$Message,
+    [string]$TargetPath = "",
+    [int]$PollSeconds = 10,
+    [int]$MaxMinutes = 60
+  )
+  Write-Warning $Message
+  try { Start-Process "chrome.exe" "--new-window $Url" } catch { Start-Process $Url }
+  $deadline = (Get-Date).AddMinutes($MaxMinutes)
+
+  while ((Get-Date) -lt $deadline) {
+    if ($TargetPath -and (Test-Path $TargetPath)) {
+      WriteLog "Manual file detected: $TargetPath"
+      return $true
+    }
+    if ($TargetPath -eq "") {
+      $resp = Read-Host "Press ENTER when you've installed it (or type S to skip)"
+      if ($resp -match '^[sS]$') { return $false } else { return $true }
+    }
+    Start-Sleep -Seconds $PollSeconds
+  }
+  return $false
 }
 
 # Chrome detection
@@ -219,7 +223,7 @@ function Test-ChromeInstalled {
   return $false
 }
 
-# Scheduled task helpers (user ONLOGON; fallback SYSTEM ONSTART)
+# Scheduled task helpers
 function Create-ResumeTask {
   param([string]$ScriptPath)
   $escaped = $ScriptPath.Replace('"','\"')
@@ -297,46 +301,58 @@ function Resume-Phase {
     Read-Host "Press Enter here after you’ve finished signing in"
   } "Chrome account sign-in (manual)"
 
-  # 4) Chrome Remote Desktop Host
+  # 4) Chrome Remote Desktop Host (auto → fallback to public → manual)
   Try-Run {
-    $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI)
-    $args = @('/i', "`"$crd`"", '/qn', '/norestart')
-    Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -NoNewWindow
+    $crd = $null
+    try { $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI) } catch {}
+    if ($crd -and (Test-Path $crd)) {
+      $msiArgs = "/i `"$crd`" /qn /norestart"
+      Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -NoNewWindow
+    } else {
+      Write-Warning "CRD auto-download failed. Opening public download page..."
+      $ok = Open-ManualAndWait -Url $FALLBACK_CRD_MSI -Message "Download & install Chrome Remote Desktop Host. Close the installer when done, then press ENTER here."
+      if (-not $ok) { Write-Warning "CRD manual step skipped by user." }
+    }
   } "Install Chrome Remote Desktop Host"
 
   # 5) .NET 3.5 (if needed)
   Try-Run { DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /Quiet /NoRestart | Out-Null } ".NET 3.5"
 
-  # 6) Python
+  # 6) Python (auto via winget/Drive/public → manual page)
   Try-Run {
     $did = $false
     if (Get-Command winget -ErrorAction SilentlyContinue) {
       try { winget install --id Python.Python.3 --silent --accept-source-agreements --accept-package-agreements | Out-Null; $did=$true } catch {}
     }
     if (-not $did) {
-      $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
-      $ext = [IO.Path]::GetExtension($py).ToLower()
-      if ($ext -eq ".msi") {
-        Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait
-      } else {
-        $ok=$false
-        foreach($sw in @('/quiet InstallAllUsers=1 PrependPath=1','/quiet','/passive','/S','/VERYSILENT','/silent')){
-          try{ Start-Process $py -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok=$true; break }catch{}
+      try {
+        $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
+        $ext = [IO.Path]::GetExtension($py).ToLower()
+        if ($ext -eq ".msi") {
+          Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait
+        } else {
+          $ok=$false
+          foreach($sw in @('/quiet InstallAllUsers=1 PrependPath=1','/quiet','/passive','/S','/VERYSILENT','/silent')){
+            try{ Start-Process $py -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok=$true; break }catch{}
+          }
+          if(-not $ok){ Write-Warning "Python installer may need interactive run; opening Python download page..."; Open-ManualAndWait -Url "https://www.python.org/downloads/windows/" -Message "Download & install Python (3.x, 64-bit). Press ENTER here when finished." | Out-Null }
         }
-        if(-not $ok){ Write-Warning "Python installer may need interactive run; check flags." }
+      } catch {
+        Write-Warning "Python auto-download failed. Opening Python download page..."
+        Open-ManualAndWait -Url "https://www.python.org/downloads/windows/" -Message "Download & install Python (3.x, 64-bit). Press ENTER here when finished." | Out-Null
       }
     }
   } "Install Python (winget or fallback)"
 
-  # 7) Machine Expert Basic (EXE from Drive; long timeouts; auto Downloads/Desktop; manual picker)
+  # 7) Machine Expert Basic (Drive auto → Downloads/Desktop → manual Drive page)
   Try-Run {
     $mebExe = $null
 
-    # 1) Try Drive (require ~450MB to avoid truncated/quota HTML)
+    # 1) Try Drive auto (require ~450MB to avoid truncated/quota HTML)
     try {
       $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 450MB
     } catch {
-      Write-Warning "Auto-download failed or incomplete."
+      Write-Warning "Machine Expert Basic auto-download failed or incomplete."
     }
 
     # 2) Auto-check common locations
@@ -350,36 +366,29 @@ function Resume-Phase {
       }
     }
 
-    # 3) Manual folder picker
+    # 3) Manual page fallback (open Drive; poll for file)
     if (-not $mebExe) {
-      Write-Warning "You can browse to the EXE manually. Save it as 'MachineExpertBasic_Setup.exe' first."
-      try {
-        $dlg = New-Object -ComObject Shell.Application
-        $folder = $dlg.BrowseForFolder(0, "Select the folder that contains MachineExpertBasic_Setup.exe", 0)
-        if ($folder) {
-          $p = Join-Path $folder.Self.Path "MachineExpertBasic_Setup.exe"
-          if (Test-Path $p -and (Get-Item $p).Length -ge 450MB -and (Test-InstallerMagic $p)) { $mebExe = $p }
-        }
-      } catch {
-        Write-Warning "Manual picker not available."
+      $targetPath = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'
+      $msg = "Drive page will open. Click 'Download anyway' and save as: $targetPath . The script will detect the file when it appears."
+      $ok = Open-ManualAndWait -Url $GDRIVE_MEB_EXE -Message $msg -TargetPath $targetPath -MaxMinutes 90
+      if ($ok -and (Test-Path $targetPath) -and (Get-Item $targetPath).Length -ge 450MB -and (Test-InstallerMagic $targetPath)) {
+        $mebExe = $targetPath
       }
     }
 
     if (-not $mebExe -or -not (Test-Path $mebExe)) { throw "Machine Expert EXE not available" }
     if ((Get-Item $mebExe).Length -lt 450MB) { throw "Downloaded EXE looks incomplete (< 450 MB): $mebExe" }
 
-    # Try common silent flags
+    # Try common silent flags; fall back to interactive if needed
     $ok = $false
     foreach ($sw in @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')) {
-      try {
-        Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop
-        $ok = $true; break
-      } catch { }
+      try { Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok = $true; break } catch { }
     }
     if (-not $ok) {
-      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see options."
+      Write-Warning "Could not find a working silent flag; launching interactive installer..."
+      Start-Process -FilePath $mebExe -Wait
     }
-  } "Install Machine Expert Basic (with easy fallback)"
+  } "Install Machine Expert Basic (with final manual fallback)"
 
   # 8) Power / background policies
   Try-Run {
