@@ -3,7 +3,7 @@
 
   Stage A: optional rename + set DPI → schedule resume & reboot if needed
   Stage B: installs/config with retries & fallbacks, Chrome sign-in, CRD, keep-awake, light hardening
-  Manual fallback: if a download fails, Chrome opens your Drive link(s) or vendor page and the script waits for you.
+  Manual fallback: if a download fails, Chrome opens your Drive/vendor page and the script waits for you.
 #>
 
 param([switch]$Resume)
@@ -16,7 +16,7 @@ $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGny
 
 # -------------------- PUBLIC FALLBACKS --------------------
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
-$FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"  # <- fixed
+$FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"  # fixed
 $FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 
 # Optional central SMB log share (e.g., "\\server\provision-logs"); leave empty to skip
@@ -304,7 +304,7 @@ function Resume-Phase {
     Read-Host "Press Enter here after you’ve finished signing in"
   } "Chrome account sign-in (manual)"
 
-  # 4) Chrome Remote Desktop Host (auto → public → manual Drive/folder)
+  # 4) Chrome Remote Desktop Host (auto → public → manual Drive/folder with file-detect)
   Try-Run {
     $crd = $null
     try { $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI) } catch {}
@@ -313,7 +313,12 @@ function Resume-Phase {
       Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -NoNewWindow
     } else {
       Write-Warning "CRD auto-download failed. Opening vendor download + your Drive folder..."
-      Open-ManualAndWait -UrlPrimary $FALLBACK_CRD_MSI -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message "Download & install Chrome Remote Desktop Host. Close the installer when done, then press ENTER here." | Out-Null
+      $targetCrd = Join-Path $env:USERPROFILE 'Downloads\chromeremotedesktophost.msi'
+      $msgCrd = "Download & save as: $targetCrd . The script continues when the file appears."
+      [void](Open-ManualAndWait -UrlPrimary $FALLBACK_CRD_MSI -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msgCrd -TargetPath $targetCrd)
+      if (Test-Path $targetCrd) {
+        Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$targetCrd`" /qn /norestart" -Wait -NoNewWindow
+      }
     }
   } "Install Chrome Remote Desktop Host"
 
@@ -328,7 +333,7 @@ function Resume-Phase {
     }
     if (-not $did) {
       try {
-        $py = Get-FromSources -LocalName "python-3.x-amd64.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
+        $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE)
         $ext = [IO.Path]::GetExtension($py).ToLower()
         if ($ext -eq ".msi") {
           Start-Process msiexec.exe -ArgumentList "/i `"$py`" /qn /norestart" -Wait
@@ -351,6 +356,13 @@ function Resume-Phase {
   Try-Run {
     $mebExe = $null
 
+    function Test-MEBFile([string]$p){
+      if (-not (Test-Path $p)) { return $false }
+      $lenOk   = ((Get-Item $p).Length -ge 450MB)
+      $magicOk = (Test-InstallerMagic $p)
+      return ($lenOk -and $magicOk)
+    }
+
     # 1) Try Drive auto (require ~450MB)
     try {
       $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 450MB
@@ -358,31 +370,38 @@ function Resume-Phase {
       Write-Warning "Machine Expert Basic auto-download failed or incomplete."
     }
 
-    # 2) Auto-check common locations
+    # 2) Auto-check common locations (no inline -and parsing issue)
     if (-not $mebExe) {
       $candidates = @(
         (Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'),
-        (Join-Path $env:USERPROFILE 'Desktop\MachineExpertBasic_Setup.exe')
+        (Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup'),
+        (Join-Path $env:USERPROFILE 'Desktop\MachineExpertBasic_Setup.exe'),
+        (Join-Path $env:USERPROFILE 'Desktop\MachineExpertBasic_Setup')
       )
       foreach ($c in $candidates) {
-        if (Test-Path $c -and (Get-Item $c).Length -ge 450MB -and (Test-InstallerMagic $c)) { $mebExe = $c; break }
+        if (Test-MEBFile $c) { $mebExe = $c; break }
       }
     }
 
-    # 3) Manual Drive file + folder fallback (poll Downloads)
+    # 3) Manual Drive file + folder fallback (poll Downloads for either name)
     if (-not $mebExe) {
-      $targetPath = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'
-      $msg = "Drive tabs will open. Click YOUR file 'MachineExpertBasic_Setup.exe' → Download anyway, and save exactly as: $targetPath . The script will continue when the file appears."
-      $ok = Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $targetPath
-      if ($ok -and (Test-Path $targetPath) -and (Get-Item $targetPath).Length -ge 450MB -and (Test-InstallerMagic $targetPath)) {
-        $mebExe = $targetPath
-      }
+      $targetMain = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'
+      $targetAlt  = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup'
+      $msg = @"
+Drive tabs will open. Click YOUR file 'MachineExpertBasic_Setup.exe' → **Download anyway**, and save as:
+  $targetMain
+(If your browser hides the extension, it may appear as: $targetAlt)
+The script continues when the file appears and validates.
+"@
+      [void](Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $targetMain)
+      if (-not (Test-Path $targetMain) -and (Test-Path $targetAlt)) { $targetMain = $targetAlt }
+      if (Test-MEBFile $targetMain) { $mebExe = $targetMain }
     }
 
     if (-not $mebExe -or -not (Test-Path $mebExe)) { throw "Machine Expert EXE not available" }
     if ((Get-Item $mebExe).Length -lt 450MB) { throw "Downloaded EXE looks incomplete (< 450 MB): $mebExe" }
 
-    # Try silent flags; fall back to interactive
+    # Try silent flags; fall back to interactive if needed
     $ok = $false
     foreach ($sw in @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')) {
       try { Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok = $true; break } catch { }
