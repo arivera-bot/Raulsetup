@@ -222,10 +222,12 @@ function Resume-Phase {
     Read-Host "Press Enter here after you’ve finished signing in"
   } "Chrome account sign-in (manual)"
 
-  # 4) Chrome Remote Desktop Host
+  # 4) Chrome Remote Desktop Host (safe args; fixes 'and' warning)
   Try-Run {
     $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI)
-    Start-Process msiexec.exe -ArgumentList "/i `"$crd`" /qn /norestart" -Wait
+    if (-not (Test-Path $crd)) { throw "CRD MSI not downloaded" }
+    $args = @('/i', "`"$crd`"", '/qn', '/norestart')
+    Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -NoNewWindow
   } "Install Chrome Remote Desktop Host"
 
   # 5) .NET 3.5 (if needed)
@@ -252,41 +254,58 @@ function Resume-Phase {
     }
   } "Install Python (winget or fallback)"
 
-  # 7) Machine Expert Basic (EXE from Drive; long timeouts; manual fallback)
+  # 7) Machine Expert Basic (EXE from Drive; long timeouts; auto Downloads/Desktop; manual picker)
   Try-Run {
     $mebExe = $null
+
+    # 1) Try Drive (requires ~400 MB minimum)
     try {
-      # require ~400 MB minimum so we know the Drive download fully completed
       $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 400MB
     } catch {
-      Write-Warning "Auto-download failed or incomplete. You can browse to the EXE manually."
+      Write-Warning "Auto-download failed or incomplete."
+    }
+
+    # 2) Auto-check common locations
+    if (-not $mebExe) {
+      $candidates = @(
+        (Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'),
+        (Join-Path $env:USERPROFILE 'Desktop\MachineExpertBasic_Setup.exe')
+      )
+      foreach ($c in $candidates) {
+        if (Test-Path $c -and (Get-Item $c).Length -ge 400MB) { $mebExe = $c; break }
+      }
+    }
+
+    # 3) Manual folder picker
+    if (-not $mebExe) {
+      Write-Warning "You can browse to the EXE manually. Save it as 'MachineExpertBasic_Setup.exe' first."
       try {
         $dlg = New-Object -ComObject Shell.Application
         $folder = $dlg.BrowseForFolder(0, "Select the folder that contains MachineExpertBasic_Setup.exe", 0)
         if ($folder) {
-          $path = Join-Path $folder.Self.Path "MachineExpertBasic_Setup.exe"
-          if (Test-Path $path) { $mebExe = $path }
+          $p = Join-Path $folder.Self.Path "MachineExpertBasic_Setup.exe"
+          if (Test-Path $p) { $mebExe = $p }
         }
       } catch {
-        Write-Warning "Manual picker not available (non-interactive session?)."
+        Write-Warning "Manual picker not available."
       }
     }
 
     if (-not $mebExe -or -not (Test-Path $mebExe)) { throw "Machine Expert EXE not available" }
     if ((Get-Item $mebExe).Length -lt 400MB) { throw "Downloaded EXE looks incomplete (< 400 MB): $mebExe" }
 
+    # Try common silent flags
     $ok = $false
-    $flags = @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')
-    foreach ($sw in $flags) {
+    foreach ($sw in @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')) {
       try {
         Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop
         $ok = $true; break
       } catch { }
     }
     if (-not $ok) {
-      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see supported options."
+      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see options."
     }
-  } "Install Machine Expert Basic (with manual fallback)"
+  } "Install Machine Expert Basic (with easy fallback)"
 
   # 8) Power / background policies
   Try-Run {
@@ -308,8 +327,8 @@ function Resume-Phase {
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Type DWord -Value 1
     New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" -Force | Out-Null
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" -Name "DisableSearchBoxSuggestions" -Type DWord -Value 1
-    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
-    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Type DWord -Value 0
+    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Dsh" -Force | Out-Null
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Dsh" -Name "AllowNewsAndInterests" -Type DWord -Value 0
     New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Force | Out-Null
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name "LetAppsRunInBackground" -Type DWord -Value 2
     Try{ Stop-Service WSearch -Force }Catch{}
