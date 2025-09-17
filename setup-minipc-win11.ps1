@@ -3,9 +3,26 @@
 
   Stage A: optional rename + set DPI → schedule resume & reboot if needed
   Stage B: installs/config with retries & fallbacks, Chrome sign-in, CRD, keep-awake, light hardening
+
+  ### NEW / UPDATED
+  - Params for PLC adapter label, Wi-Fi, and CRD headless
+  - Rename PLC adapter to "PLC<Label>" and set static IPv4 192.168.1.100/24
+  - Optional Wi-Fi join from SSID/password (creates a temp XML profile)
+  - CRD headless registration flow: paste the Headless "PowerShell" command; we extract --code/--redirect-url and register with your PIN and name
 #>
 
-param([switch]$Resume)
+param(
+  [switch]$Resume,
+
+  ### NEW / UPDATED — convenience params
+  [ValidatePattern('^[A-Z]$')]
+  [string]$AdapterLabel,              # e.g. "A" → adapter renamed to "PLCA"
+  [string]$WifiSsid,                  # optional Wi-Fi SSID
+  [string]$WifiKey,                   # optional Wi-Fi password (WPA2/PSK)
+  [switch]$CRDHeadless,               # enable semi-automated CRD headless setup
+  [string]$CRDPin = "748447",         # CRD host PIN
+  [switch]$CRDNameFromComputer        # name CRD host as the (possibly new) computer name
+)
 
 # -------------------- PRIMARY LINKS --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
@@ -15,15 +32,13 @@ $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX8
 # -------------------- PUBLIC FALLBACKS --------------------
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/chrome-remote-desktop/chromeremotedesktophost.msi"
-$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"   # adjust if preferred
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 
 # Optional central SMB log share (e.g., "\\server\provision-logs"); leave empty to skip
 $CentralLogShare = ""
 
 $TaskName = "ProvisionMiniPC_AutoResume"
 $ErrorActionPreference = 'Stop'
-
-# Force TLS 1.2 for Invoke-WebRequest on fresh images
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------- Paths & logging --------------------
@@ -31,7 +46,6 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Here) { $Here = $env:TEMP }
 $Log  = Join-Path $Here "setup-mini-pc.log"
 "=== Run: $(Get-Date) on $env:COMPUTERNAME (Resume=$Resume) ===" | Out-File $Log -Append -Encoding utf8
-
 function WriteLog($m){ $m | Out-File -FilePath $Log -Append -Encoding utf8 }
 function Try-Run($sb, $desc){ try{ & $sb; WriteLog "OK: $desc" } catch{ WriteLog ("ERR: {0} :: {1}" -f $desc, $_.Exception.Message); Write-Warning "Failed: $desc -> $($_.Exception.Message)" } }
 
@@ -72,8 +86,8 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath,[int]$T
   else{ throw "Couldn't parse Google Drive ID from $ShareUrl" }
 
   $base = "https://docs.google.com/uc?export=download&id=$id"
-  $sess = $null
   if(Test-Path $DestinationPath){ Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue }
+  $sess = $null
   $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -SessionVariable sess -TimeoutSec $TimeoutSec
 
   $ct = $r1.Headers['Content-Type']
@@ -94,7 +108,7 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath,[int]$T
     Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath -TimeoutSec $TimeoutSec
   }
 
-  # Wait for size to stabilize (handles slow Drive assembly)
+  # Wait for size to stabilize
   $stableCount=0; $lastSize=-1
   while($stableCount -lt 3){
     if(-not (Test-Path $DestinationPath)){ Start-Sleep 2; continue }
@@ -192,6 +206,110 @@ if (-not $Resume -and $needReboot) {
   exit 0
 }
 
+# -------------------- NEW: Networking helpers --------------------
+function Get-PrimaryEthernet {
+  # choose the first Up/Connected ethernet-like adapter (exclude Wi-Fi, Bluetooth, virtual)
+  $cands = Get-NetAdapter -Physical | Where-Object {
+    $_.Status -ne 'Disabled' -and $_.Name -notmatch 'Wi-?Fi|WLAN|Bluetooth|Virtual|VMware|Hyper-V|VEthernet'
+  } | Sort-Object -Property { $_.Status -eq 'Up' } -Descending, InterfaceMetric
+  return $cands | Select-Object -First 1
+}
+
+function Set-PLCAdapterAndIP {
+  param([string]$Label) # single letter like A/B/C...
+  if (-not $Label) { return }
+  $alias = "PLC$Label"
+  $ad = Get-PrimaryEthernet
+  if (-not $ad) { Write-Warning "No suitable Ethernet adapter found for PLC rename/IP."; return }
+  $old = $ad.Name
+  if ($old -ne $alias) {
+    Try-Run { Rename-NetAdapter -Name $old -NewName $alias -PassThru | Out-Null } "Rename adapter $old → $alias"
+  } else {
+    WriteLog "Adapter already named $alias"
+  }
+
+  # Clear DHCP and assign static 192.168.1.100/24 (no gateway/DNS)
+  Try-Run { Set-NetIPInterface -InterfaceAlias $alias -Dhcp Disabled -ErrorAction SilentlyContinue } "Disable DHCP on $alias"
+  # Remove existing IPv4 addresses on that interface before setting
+  Try-Run {
+    Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+  } "Clear old IPv4 addresses on $alias"
+  Try-Run {
+    New-NetIPAddress -InterfaceAlias $alias -IPAddress 192.168.1.100 -PrefixLength 24 -ErrorAction Stop | Out-Null
+    Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction SilentlyContinue
+  } "Set $alias IPv4 192.168.1.100/24"
+}
+
+function Ensure-WiFi {
+  param([string]$Ssid,[string]$Key)
+  if (-not $Ssid) { return }
+  $wifiAdp = Get-NetAdapter | Where-Object { $_.Name -match 'Wi-?Fi|WLAN' -and $_.Status -ne 'Disabled' } | Select-Object -First 1
+  if (-not $wifiAdp) { Write-Warning "No Wi-Fi adapter found."; return }
+  # If a profile exists, try to connect; else create a temp profile XML
+  $profiles = netsh wlan show profiles | Out-String
+  if ($profiles -notmatch [regex]::Escape($Ssid)) {
+    if (-not $Key) { Write-Warning "No Wi-Fi profile for '$Ssid' and no key supplied — skipping."; return }
+    $tmp = Join-Path $env:TEMP "wifi-$($Ssid).xml"
+    $xml = @"
+<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>$Ssid</name>
+  <SSIDConfig><SSID><name>$Ssid</name></SSID></SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>auto</connectionMode>
+  <MSM>
+    <security>
+      <authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption>
+      <sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>$Key</keyMaterial></sharedKey>
+    </security>
+  </MSM>
+</WLANProfile>
+"@
+    $xml | Out-File -Encoding ascii $tmp
+    Try-Run { netsh wlan add profile filename="$tmp" | Out-Null } "Add Wi-Fi profile $Ssid"
+  }
+  Try-Run { netsh wlan connect name="$Ssid" ssid="$Ssid" | Out-Null } "Connect Wi-Fi $Ssid"
+}
+
+# -------------------- NEW: CRD headless helper --------------------
+function Setup-CRDHeadless {
+  param([string]$Pin,[string]$HostName)
+  $startExe = Join-Path "${env:ProgramFiles}\Google\Chrome Remote Desktop\CurrentVersion" "remoting_start_host.exe"
+  if (-not (Test-Path $startExe)) { Write-Warning "CRD start host not found at $startExe"; return }
+
+  Write-Host "`nOpening CRD Headless setup page..." -ForegroundColor Cyan
+  Start-Process "chrome.exe" "https://remotedesktop.google.com/headless"
+
+  Write-Host @"
+IMPORTANT (one-time per machine):
+  1) In the browser: choose 'Set up via another computer' → 'Begin' → 'Next' → pick 'Windows'
+  2) Copy the big **PowerShell** command shown (it contains --code and --redirect-url)
+  3) Paste it below when prompted (CTRL+V), press Enter.
+I will extract the tokens and register this host with your PIN and name.
+"@ -ForegroundColor Yellow
+
+  $cmd = Read-Host "Paste the entire Headless PowerShell command"
+  if (-not $cmd -or $cmd.Length -lt 50) { Write-Warning "No headless command pasted; skipping."; return }
+
+  # Extract --code and --redirect-url
+  $code = $null; $redir = $null
+  if ($cmd -match '--code\s*"?([^"\s]+)"?') { $code = $Matches[1] }
+  if ($cmd -match '--redirect-url\s*"?([^"\s]+)"?') { $redir = $Matches[1] }
+  if (-not $code -or -not $redir) { Write-Warning "Could not parse --code/--redirect-url; skipping."; return }
+
+  $args = @(
+    "--code=$code",
+    "--redirect-url=$redir",
+    "--name=""$HostName""",
+    "--pin=$Pin"
+  )
+
+  Try-Run {
+    Start-Process -FilePath $startExe -ArgumentList $args -Wait -NoNewWindow
+  } "CRD headless register as '$HostName' with PIN"
+}
+
 # -------------------- Stage B: Resume-Phase (installs/config) --------------------
 function Resume-Phase {
 
@@ -222,7 +340,7 @@ function Resume-Phase {
     Read-Host "Press Enter here after you’ve finished signing in"
   } "Chrome account sign-in (manual)"
 
-  # 4) Chrome Remote Desktop Host (safe args; fixes 'and' warning)
+  # 4) Chrome Remote Desktop Host
   Try-Run {
     $crd = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI)
     if (-not (Test-Path $crd)) { throw "CRD MSI not downloaded" }
@@ -254,31 +372,19 @@ function Resume-Phase {
     }
   } "Install Python (winget or fallback)"
 
-  # 7) Machine Expert Basic (EXE from Drive; long timeouts; auto Downloads/Desktop; manual picker)
+  # 7) Machine Expert Basic (Drive or manual)
   Try-Run {
     $mebExe = $null
-
-    # 1) Try Drive (requires ~400 MB minimum)
-    try {
-      $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 400MB
-    } catch {
-      Write-Warning "Auto-download failed or incomplete."
-    }
-
-    # 2) Auto-check common locations
+    try { $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 400MB } catch { Write-Warning "Auto-download failed or incomplete." }
     if (-not $mebExe) {
       $candidates = @(
         (Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'),
         (Join-Path $env:USERPROFILE 'Desktop\MachineExpertBasic_Setup.exe')
       )
-      foreach ($c in $candidates) {
-        if (Test-Path $c -and (Get-Item $c).Length -ge 400MB) { $mebExe = $c; break }
-      }
+      foreach ($c in $candidates) { if (Test-Path $c -and (Get-Item $c).Length -ge 400MB) { $mebExe = $c; break } }
     }
-
-    # 3) Manual folder picker
     if (-not $mebExe) {
-      Write-Warning "You can browse to the EXE manually. Save it as 'MachineExpertBasic_Setup.exe' first."
+      Write-Warning "Browse to the EXE manually (save as MachineExpertBasic_Setup.exe)."
       try {
         $dlg = New-Object -ComObject Shell.Application
         $folder = $dlg.BrowseForFolder(0, "Select the folder that contains MachineExpertBasic_Setup.exe", 0)
@@ -286,28 +392,19 @@ function Resume-Phase {
           $p = Join-Path $folder.Self.Path "MachineExpertBasic_Setup.exe"
           if (Test-Path $p) { $mebExe = $p }
         }
-      } catch {
-        Write-Warning "Manual picker not available."
-      }
+      } catch { Write-Warning "Manual picker not available." }
     }
-
     if (-not $mebExe -or -not (Test-Path $mebExe)) { throw "Machine Expert EXE not available" }
     if ((Get-Item $mebExe).Length -lt 400MB) { throw "Downloaded EXE looks incomplete (< 400 MB): $mebExe" }
 
-    # Try common silent flags
     $ok = $false
     foreach ($sw in @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')) {
-      try {
-        Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop
-        $ok = $true; break
-      } catch { }
+      try { Start-Process -FilePath $mebExe -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok = $true; break } catch { }
     }
-    if (-not $ok) {
-      Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see options."
-    }
+    if (-not $ok) { Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see options." }
   } "Install Machine Expert Basic (with easy fallback)"
 
-  # 8) Power / background policies
+  # 8) Keep awake / reduce background
   Try-Run {
     powercfg /HIBERNATE OFF
     powercfg -Change -standby-timeout-ac 0
@@ -346,8 +443,17 @@ function Resume-Phase {
     }
   } "Firewall rules for CRD"
 
-  # 10) Open CRD activation UI
+  # 10) Optional: Wi-Fi + PLC adapter + CRD headless
+  if ($WifiSsid) { Ensure-WiFi -Ssid $WifiSsid -Key $WifiKey }
+  if ($AdapterLabel) { Set-PLCAdapterAndIP -Label $AdapterLabel }
+
+  # 11) CRD activation page (standard) and/or Headless quick register
   Try-Run { Start-Process "chrome.exe" "https://remotedesktop.google.com/access" } "Open CRD activation page"
+  if ($CRDHeadless) {
+    $hostName = if ($CRDNameFromComputer) { $env:COMPUTERNAME } else { Read-Host "Enter CRD Host Name (or leave blank to use $env:COMPUTERNAME)" }
+    if (-not $hostName) { $hostName = $env:COMPUTERNAME }
+    Setup-CRDHeadless -Pin $CRDPin -HostName $hostName
+  }
 
   # Optional: upload log
   if ($CentralLogShare -and ($CentralLogShare -ne "")) {
