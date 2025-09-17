@@ -1,5 +1,6 @@
 <#
   setup-minipc-win11.ps1  — RUN AS ADMIN (PowerShell 5.1 compatible)
+
   Stage A: optional rename + set DPI → schedule resume & reboot if needed
   Stage B: installs/config with retries & fallbacks, Chrome sign-in, CRD, keep-awake, light hardening
 #>
@@ -8,7 +9,7 @@ param([switch]$Resume)
 
 # -------------------- PRIMARY LINKS --------------------
 $GDRIVE_PY_EXE   = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
-$GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # Machine Expert Basic EXE
+$GDRIVE_MEB_EXE  = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"  # Machine Expert Basic EXE (~479 MB)
 $GDRIVE_CRD_MSI  = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 
 # -------------------- PUBLIC FALLBACKS --------------------
@@ -48,15 +49,23 @@ function Wait-Network([int]$TimeoutSec=120){
   WriteLog "Network NOT ready after $TimeoutSec s"; return $false
 }
 
-function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=3,[int]$DelaySec=5){
+function Invoke-WebRequest-Retry([string]$Uri,[string]$OutFile,[int]$Retries=4,[int]$DelaySec=8,[int]$TimeoutSec=1800){
   for($i=1;$i -le $Retries;$i++){
-    try{ Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 240; WriteLog ("Downloaded {0} -> {1}" -f $Uri,$OutFile); return }
-    catch{ WriteLog ("Attempt {0}/{1} failed: {2}" -f $i,$Retries,$_.Exception.Message); if($i -eq $Retries){throw}; Start-Sleep $DelaySec }
+    try{
+      if(Test-Path $OutFile){ Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+      Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec
+      if((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 1MB)){ return }
+      throw "Downloaded file missing or too small"
+    }catch{
+      WriteLog ("Attempt {0}/{1} failed: {2}" -f $i,$Retries,$_.Exception.Message)
+      if($i -eq $Retries){ throw }
+      Start-Sleep $DelaySec
+    }
   }
 }
 
-# Google Drive downloader (Invoke-WebRequest + cookies; NO HttpClient)
-function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
+# Google Drive downloader (confirm-token + size-stabilize)
+function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath,[int]$TimeoutSec=1800){
   if(-not $ShareUrl){ throw "No URL supplied." }
   if($ShareUrl -match '/d/([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
   elseif($ShareUrl -match 'id=([A-Za-z0-9_-]+)'){ $id=$Matches[1] }
@@ -64,52 +73,61 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath){
 
   $base = "https://docs.google.com/uc?export=download&id=$id"
   $sess = $null
-  $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -SessionVariable sess
+  if(Test-Path $DestinationPath){ Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue }
+  $r1 = Invoke-WebRequest -UseBasicParsing -Uri $base -SessionVariable sess -TimeoutSec $TimeoutSec
 
-  # If not HTML, likely direct download → write to file
   $ct = $r1.Headers['Content-Type']
   if ($ct -and $ct -notlike 'text/html*') {
-    Invoke-WebRequest -UseBasicParsing -Uri $base -WebSession $sess -OutFile $DestinationPath
-    return
-  }
-
-  # Find confirm token (HTML or cookie)
-  $html  = $r1.RawContent
-  $token = $null
-  if ($html -match 'confirm=([0-9A-Za-z_-]+)') { $token = $Matches[1] }
-  elseif ($r1.Content -match 'name="confirm" value="([0-9A-Za-z_-]+)"') { $token = $Matches[1] }
-  if (-not $token) {
-    foreach ($cookie in $sess.Cookies.GetCookies([uri]$base)) {
-      if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break }
+    Invoke-WebRequest -UseBasicParsing -Uri $base -WebSession $sess -OutFile $DestinationPath -TimeoutSec $TimeoutSec
+  } else {
+    $html  = $r1.RawContent
+    $token = $null
+    if ($html -match 'confirm=([0-9A-Za-z_-]+)') { $token = $Matches[1] }
+    elseif ($r1.Content -match 'name="confirm" value="([0-9A-Za-z_-]+)"') { $token = $Matches[1] }
+    if (-not $token) {
+      foreach ($cookie in $sess.Cookies.GetCookies([uri]$base)) {
+        if ($cookie.Name -like 'download_warning*') { $token = $cookie.Value; break }
+      }
     }
+    if (-not $token) { throw "Could not obtain Drive confirm token (large file)." }
+    $url2 = "$base&confirm=$token"
+    Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath -TimeoutSec $TimeoutSec
   }
-  if (-not $token) { throw "Could not obtain Drive confirm token (large file)." }
 
-  $url2 = "$base&confirm=$token"
-  Invoke-WebRequest -UseBasicParsing -Uri $url2 -WebSession $sess -OutFile $DestinationPath
+  # Wait for size to stabilize (handles slow Drive assembly)
+  $stableCount=0; $lastSize=-1
+  while($stableCount -lt 3){
+    if(-not (Test-Path $DestinationPath)){ Start-Sleep 2; continue }
+    $sz=(Get-Item $DestinationPath).Length
+    if($sz -eq $lastSize -and $sz -gt 1MB){ $stableCount++ } else { $stableCount=0; $lastSize=$sz }
+    Start-Sleep 2
+  }
 }
 
 # Download chain with multiple fallbacks
 function Get-FromSources {
   param(
     [string]$LocalName,
-    [string[]]$Sources
+    [string[]]$Sources,
+    [int]$MinBytes = 1MB
   )
   $local = Join-Path $Here $LocalName
-  if (Test-Path $local) { WriteLog "Using local $local"; return $local }
+  if (Test-Path $local -and (Get-Item $local).Length -ge $MinBytes) { WriteLog "Using local $local"; return $local }
 
   $dest = Join-Path $env:TEMP $LocalName
   foreach ($u in $Sources) {
     if (-not $u) { continue }
     try {
+      if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
       if ($u -like "*drive.google.com*") {
         WriteLog "Downloading from Drive: $u"
-        Download-GoogleDrive -ShareUrl $u -DestinationPath $dest
+        Download-GoogleDrive -ShareUrl $u -DestinationPath $dest -TimeoutSec 1800
       } else {
         WriteLog "Downloading: $u"
-        Invoke-WebRequest-Retry -Uri $u -OutFile $dest -Retries 3 -DelaySec 6
+        Invoke-WebRequest-Retry -Uri $u -OutFile $dest -Retries 4 -DelaySec 8 -TimeoutSec 1800
       }
-      if (Test-Path $dest) { return $dest }
+      if ((Test-Path $dest) -and ((Get-Item $dest).Length -ge $MinBytes)) { return $dest }
+      WriteLog "Downloaded file too small from $u"
     } catch {
       WriteLog ("Source failed: {0} :: {1}" -f $u, $_.Exception.Message)
     }
@@ -234,10 +252,28 @@ function Resume-Phase {
     }
   } "Install Python (winget or fallback)"
 
-  # 7) Machine Expert Basic (EXE from Drive; try common silent flags)
+  # 7) Machine Expert Basic (EXE from Drive; long timeouts; manual fallback)
   Try-Run {
-    $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE)
-    if (-not (Test-Path $mebExe)) { throw "Machine Expert EXE not downloaded" }
+    $mebExe = $null
+    try {
+      # require ~400 MB minimum so we know the Drive download fully completed
+      $mebExe = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 400MB
+    } catch {
+      Write-Warning "Auto-download failed or incomplete. You can browse to the EXE manually."
+      try {
+        $dlg = New-Object -ComObject Shell.Application
+        $folder = $dlg.BrowseForFolder(0, "Select the folder that contains MachineExpertBasic_Setup.exe", 0)
+        if ($folder) {
+          $path = Join-Path $folder.Self.Path "MachineExpertBasic_Setup.exe"
+          if (Test-Path $path) { $mebExe = $path }
+        }
+      } catch {
+        Write-Warning "Manual picker not available (non-interactive session?)."
+      }
+    }
+
+    if (-not $mebExe -or -not (Test-Path $mebExe)) { throw "Machine Expert EXE not available" }
+    if ((Get-Item $mebExe).Length -lt 400MB) { throw "Downloaded EXE looks incomplete (< 400 MB): $mebExe" }
 
     $ok = $false
     $flags = @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')
@@ -250,7 +286,7 @@ function Resume-Phase {
     if (-not $ok) {
       Write-Warning "Machine Expert Basic may require interactive install or specific flags. Try: `"$mebExe`" /? to see supported options."
     }
-  } "Install Machine Expert Basic"
+  } "Install Machine Expert Basic (with manual fallback)"
 
   # 8) Power / background policies
   Try-Run {
@@ -316,4 +352,3 @@ function Resume-Phase {
 # Always run resume-phase now (if we needed a reboot we already exited above)
 Resume-Phase
 WriteLog "Done: $(Get-Date)"
-
