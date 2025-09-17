@@ -215,41 +215,29 @@ function Get-PrimaryEthernet {
   return $cands | Select-Object -First 1
 }
 
-function Set-PLCAdapterAndIP {
-  param([string]$Label) # single letter like A/B/C...
-  if (-not $Label) { return }
-  $alias = "PLC$Label"
-  $ad = Get-PrimaryEthernet
-  if (-not $ad) { Write-Warning "No suitable Ethernet adapter found for PLC rename/IP."; return }
-  $old = $ad.Name
-  if ($old -ne $alias) {
-    Try-Run { Rename-NetAdapter -Name $old -NewName $alias -PassThru | Out-Null } "Rename adapter $old → $alias"
-  } else {
-    WriteLog "Adapter already named $alias"
-  }
-
-  # Clear DHCP and assign static 192.168.1.100/24 (no gateway/DNS)
-  Try-Run { Set-NetIPInterface -InterfaceAlias $alias -Dhcp Disabled -ErrorAction SilentlyContinue } "Disable DHCP on $alias"
-  # Remove existing IPv4 addresses on that interface before setting
-  Try-Run {
-    Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-      Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-  } "Clear old IPv4 addresses on $alias"
-  Try-Run {
-    New-NetIPAddress -InterfaceAlias $alias -IPAddress 192.168.1.100 -PrefixLength 24 -ErrorAction Stop | Out-Null
-    Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction SilentlyContinue
-  } "Set $alias IPv4 192.168.1.100/24"
+function Get-PrimaryEthernet {
+  # choose the first Up/Connected ethernet-like adapter (exclude Wi-Fi, Bluetooth, virtual)
+  $cands = Get-NetAdapter -Physical |
+    Where-Object {
+      $_.Status -ne 'Disabled' -and $_.Name -notmatch 'Wi-?Fi|WLAN|Bluetooth|Virtual|VMware|Hyper-V|VEthernet'
+    } |
+    Sort-Object `
+      -Property @{ Expression = { $_.Status -eq 'Up' }; Descending = $true }, `
+                @{ Expression = { $_.InterfaceMetric } }  # ascending
+  return $cands | Select-Object -First 1
 }
 
 function Ensure-WiFi {
-  param([string]$Ssid,[string]$Key)
+  param([string]$Ssid,[string]$WifiKey)
   if (-not $Ssid) { return }
+
   $wifiAdp = Get-NetAdapter | Where-Object { $_.Name -match 'Wi-?Fi|WLAN' -and $_.Status -ne 'Disabled' } | Select-Object -First 1
   if (-not $wifiAdp) { Write-Warning "No Wi-Fi adapter found."; return }
-  # If a profile exists, try to connect; else create a temp profile XML
+
   $profiles = netsh wlan show profiles | Out-String
   if ($profiles -notmatch [regex]::Escape($Ssid)) {
-    if (-not $Key) { Write-Warning "No Wi-Fi profile for '$Ssid' and no key supplied — skipping."; return }
+    if (-not $WifiKey) { Write-Warning "No Wi-Fi profile for '$Ssid' and no key supplied — skipping."; return }
+
     $tmp = Join-Path $env:TEMP "wifi-$($Ssid).xml"
     $xml = @"
 <?xml version="1.0"?>
@@ -260,8 +248,16 @@ function Ensure-WiFi {
   <connectionMode>auto</connectionMode>
   <MSM>
     <security>
-      <authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption>
-      <sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>$Key</keyMaterial></sharedKey>
+      <authEncryption>
+        <authentication>WPA2PSK</authentication>
+        <encryption>AES</encryption>
+        <useOneX>false</useOneX>
+      </authEncryption>
+      <sharedKey>
+        <keyType>passPhrase</keyType>
+        <protected>false</protected>
+        <keyMaterial>$WifiKey</keyMaterial>
+      </sharedKey>
     </security>
   </MSM>
 </WLANProfile>
@@ -269,6 +265,7 @@ function Ensure-WiFi {
     $xml | Out-File -Encoding ascii $tmp
     Try-Run { netsh wlan add profile filename="$tmp" | Out-Null } "Add Wi-Fi profile $Ssid"
   }
+
   Try-Run { netsh wlan connect name="$Ssid" ssid="$Ssid" | Out-Null } "Connect Wi-Fi $Ssid"
 }
 
