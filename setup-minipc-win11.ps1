@@ -1,9 +1,9 @@
 <#
   setup-minipc-win11.ps1 — RUN AS ADMIN (PowerShell 5.1)
-  Goal: install needed apps, keep system always-on, halt Windows Update,
-        disable OneDrive, hide Edge, pin Chrome, and configure PLC NIC.
-  NOTE: Script does NOT change display scaling unless you opt-in when prompted.
-        It ALWAYS enables ClearType to avoid grainy fonts.
+  Purpose: install needed apps, keep system always-on, halt Windows Update,
+           remove/disable OneDrive, suppress Edge + pin Chrome,
+           and configure PLC NIC (rename to PLC<last letter> + static IP).
+  Notes:   Won’t change scaling unless you opt-in; always enforces ClearType.
 #>
 
 param([switch]$Resume)
@@ -16,7 +16,7 @@ $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGny
 
 # Public fallbacks
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
-$FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"  # fixed
+$FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
 $FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 
 # ====== Setup ======
@@ -218,9 +218,28 @@ function Set-PLCAdapter {
   Report "PLC NIC '$newAlias' set to $IPAddress/$Prefix (no gateway, DNS empty)."
 }
 
-# ====== Edge suppression & Chrome pin ======
+# ====== Taskbar verbs for reliable pin/unpin ======
+function Invoke-ShellVerb {
+  param([string]$Path, [string]$VerbMatch)
+  if (-not (Test-Path $Path)) { return $false }
+  $folder = Split-Path $Path
+  $file   = Split-Path $Path -Leaf
+  $shell  = New-Object -ComObject Shell.Application
+  $item   = $shell.Namespace($folder).ParseName($file)
+  if (-not $item) { return $false }
+  $done = $false
+  foreach ($v in $item.Verbs()) {
+    $name = ($v.Name -replace '&','').Trim()
+    if ($name -like "*$VerbMatch*") { $v.DoIt(); $done = $true; break }
+  }
+  return $done
+}
+function Refresh-Explorer { 
+  Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Process explorer.exe
+}
 function Hide-Edge-And-Pin-Chrome {
-  # Policies
+  # Policies to suppress Edge noise
   New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Force | Out-Null
   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "HideFirstRunExperience" -Type DWord -Value 1
   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "DefaultBrowserSettingEnabled" -Type DWord -Value 0
@@ -228,44 +247,22 @@ function Hide-Edge-And-Pin-Chrome {
   Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "StandaloneDownloadsEnabled" -Type DWord -Value 0
   reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" /v "DisableEdgeDesktopShortcutCreation" /t REG_DWORD /d 1 /f | Out-Null
 
-  # Remove Edge shortcuts/pins
-  $pinDir   = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
-  $startMF  = Join-Path $env:PROGRAMDATA 'Microsoft\Windows\Start Menu\Programs'
-  $startMU  = Join-Path $env:APPDATA     'Microsoft\Windows\Start Menu\Programs'
-  $desktopU = [Environment]::GetFolderPath('Desktop')
-  $edgePaths = @(
-    (Join-Path $pinDir     '*.lnk'),
-    (Join-Path $startMF    'Microsoft Edge*.lnk'),
-    (Join-Path $startMU    'Microsoft Edge*.lnk'),
-    (Join-Path $desktopU   'Microsoft Edge*.lnk')
-  )
-  foreach($g in $edgePaths){
-    Get-ChildItem $g -ErrorAction SilentlyContinue |
-      Where-Object { Select-String -Path $_.FullName -Pattern 'msedge\.exe' -SimpleMatch -ErrorAction SilentlyContinue } |
-      Remove-Item -Force -ErrorAction SilentlyContinue
-  }
+  # Paths
+  $edge = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
+  if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+  $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+  if (-not (Test-Path $chrome)) { $chrome = "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe" }
 
-  # Add Chrome shortcut & pin
-  $chromeExe = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-  if (-not (Test-Path $chromeExe)) { $chromeExe = "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe" }
-  if (Test-Path $chromeExe) {
-    function New-Shortcut($lnkPath, $target, $args="", $icon=""){
-      $w = New-Object -ComObject WScript.Shell
-      $s = $w.CreateShortcut($lnkPath)
-      $s.TargetPath = $target
-      if($args){ $s.Arguments = $args }
-      if($icon){ $s.IconLocation = $icon }
-      $s.Save()
-    }
-    $chromeStart   = Join-Path $startMU 'Google Chrome.lnk'
-    $chromeTaskbar = Join-Path $pinDir  'Google Chrome.lnk'
-    if (-not (Test-Path $chromeStart))   { New-Shortcut $chromeStart   $chromeExe "" $chromeExe }
-    if (-not (Test-Path $chromeTaskbar)) { New-Shortcut $chromeTaskbar $chromeExe "" $chromeExe }
-    # Refresh taskbar
-    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Process explorer.exe
-  }
-  Report "Edge hidden/unpinned; Chrome pinned to taskbar."
+  # Unpin Edge; Pin Chrome via verbs (with retry)
+  $u1 = Invoke-ShellVerb -Path $edge   -VerbMatch "Unpin from taskbar"; Start-Sleep 1
+  $p1 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar";      Start-Sleep 1
+  Refresh-Explorer; Start-Sleep 2
+  $u2 = Invoke-ShellVerb -Path $edge   -VerbMatch "Unpin from taskbar"
+  $p2 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar"
+  Refresh-Explorer
+
+  if ($u1 -or $u2) { Report "Edge unpinned from taskbar." } else { $Global:ChangeReport += "NOTE: Edge might already be unpinned (verb missing)." }
+  if ($p1 -or $p2) { Report "Chrome pinned to taskbar." } else { $Global:ChangeReport += "FAILED: Could not pin Chrome (verb not found?)." }
 }
 
 # ====== Stage A: rename + optional DPI + ClearType ======
@@ -306,7 +303,7 @@ function Resume-Phase {
   WriteLog "=== RESUME PHASE START ==="
   if (-not (Wait-Network -TimeoutSec 120)) { Write-Warning "Network not ready; continuing." }
 
-  # Defender exclusions (light)
+  # Defender exclusions
   Try-Run {
     Add-MpPreference -ExclusionPath $Here -ErrorAction SilentlyContinue
     Add-MpPreference -ExclusionProcess "powershell.exe" -ErrorAction SilentlyContinue
@@ -325,13 +322,13 @@ function Resume-Phase {
     } "Install Chrome"
   }
 
-  # 2) Default app prompt (Win11)
+  # 2) Default apps page (so you can set Chrome default easily)
   Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 3 } "Open Default Apps (minimized)"
 
   # 3) Chrome sign-in (manual)
   Try-Run {
     Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"
-    Write-Host "`nPlease sign into Chrome as service@thetrivialcompany.com (enable sync)."
+    Write-Host "`nSign into Chrome as service@thetrivialcompany.com (enable sync)."
     Read-Host "Press ENTER here after you’ve finished signing in"
   } "Chrome account sign-in"
 
@@ -346,15 +343,13 @@ function Resume-Phase {
       if (Test-Path $target) { $crdLocal = $target }
     }
     if ($crdLocal) {
-      $args = "/i `"$crdLocal`" /qn /norestart"
-      WriteLog "Installing CRD Host via msiexec $args"
-      Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -NoNewWindow
+      Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$crdLocal`" /qn /norestart" -Wait -NoNewWindow
     }
     $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
     $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "Chrome Remote Desktop*" }
     if ((Test-Path $hostExe) -or $svc) { Report "Chrome Remote Desktop Host installed." }
     else {
-      Write-Warning "CRD Host not detected after install. Launching vendor page for interactive install…"
+      Write-Warning "CRD Host not detected after install. Opening access page…"
       Start-Process "chrome.exe" "--new-window https://remotedesktop.google.com/access" | Out-Null
       $Global:ChangeReport += "ACTION NEEDED: Finish CRD host install in browser."
     }
@@ -363,7 +358,7 @@ function Resume-Phase {
   # 5) .NET 3.5
   Try-Run { DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /Quiet /NoRestart | Out-Null } ".NET 3.5 enabled"
 
-  # 6) Python (detect → silent install → verify)
+  # 6) Python
   Try-Run {
     function Test-Python { return (Get-Command python -ErrorAction SilentlyContinue) -or (Get-Command py -ErrorAction SilentlyContinue) }
     if (Test-Python) { Report "Python already present." }
@@ -373,8 +368,7 @@ function Resume-Phase {
       if (-not $py) {
         [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Download Python 3.x (64-bit) and run it. Press ENTER here when done.")
       } else {
-        $silent = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0"
-        Start-Process -FilePath $py -ArgumentList $silent -Wait -NoNewWindow
+        Start-Process -FilePath $py -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait -NoNewWindow
       }
       if (Test-Python) { Report "Python installed and in PATH." } else { $Global:ChangeReport += "FAILED: Python not detected after attempt." }
     }
@@ -390,7 +384,7 @@ function Resume-Phase {
     }
     if (-not $meb) {
       $target = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'
-      $msg = "Drive will open. Click 'Download anyway' and save exactly as: $target . Script continues when file appears."
+      $msg = "Drive will open. Click 'Download anyway' and save as: $target . Script continues when file appears."
       [void](Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
       if (Test-MEBFile $target){ $meb=$target }
     }
@@ -399,7 +393,7 @@ function Resume-Phase {
     foreach($sw in @('/S','/silent','/verysilent','/qn','/quiet','/s','/passive')){
       try{ Start-Process -FilePath $meb -ArgumentList $sw -Wait -NoNewWindow -ErrorAction Stop; $ok=$true; break }catch{}
     }
-    if (-not $ok){ WriteLog "Launching Machine Expert interactively…"; Start-Process -FilePath $meb -Wait }
+    if (-not $ok){ Start-Process -FilePath $meb -Wait }
     Report "Machine Expert Basic installed (or launched for manual install)."
   } "Install Machine Expert Basic"
 
@@ -437,7 +431,7 @@ function Resume-Phase {
     }
   } "Halt Windows Update (services + policies + tasks)"
 
-  # 10) OneDrive — remove & block
+  # 10) OneDrive — remove & block (quiet if keys missing)
   Try-Run {
     $envSys = "$env:SystemRoot\System32\OneDriveSetup.exe"
     $envWow = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
@@ -449,18 +443,23 @@ function Resume-Phase {
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSyncNGSC" -Type DWord -Value 1
     New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Skydrive" -Force | Out-Null
     Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Skydrive" -Name "DisableLibrariesDefaultSaveToSkyDrive" -Type DWord -Value 1
-    reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDrive /f 2>$null | Out-Null
-    reg delete "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDrive /f 2>$null | Out-Null
+    foreach($rk in @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Run","HKLM:\Software\Microsoft\Windows\CurrentVersion\Run")){
+      if (Test-Path $rk) {
+        if (Get-ItemProperty -Path $rk -Name OneDrive -ErrorAction SilentlyContinue) {
+          Remove-ItemProperty -Path $rk -Name OneDrive -ErrorAction SilentlyContinue
+        }
+      }
+    }
     Get-ScheduledTask -TaskName "*OneDrive*" -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
     Remove-Item "$env:UserProfile\OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:LocalAppData\Microsoft\OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:ProgramData\Microsoft OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
   } "OneDrive removed and disabled"
 
-  # 11) Edge surface area down + Chrome pinned
-  Try-Run { Hide-Edge-And-Pin-Chrome } "Edge hidden, Chrome pinned"
+  # 11) Edge surface area down + Chrome pinned (shell verbs)
+  Try-Run { Hide-Edge-And-Pin-Chrome } "Taskbar: pin Chrome, unpin Edge"
 
-  # 12) PLC NIC: rename to PLC<last-letter-of-computer-name> & set static IP
+  # 12) PLC NIC: rename to PLC<last-letter> & set static IP
   Try-Run { Set-PLCAdapter -IPAddress "192.168.1.100" -Prefix 24 } "Configure PLC NIC"
 
   # 13) CRD firewall + open access page
