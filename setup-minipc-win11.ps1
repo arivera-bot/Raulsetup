@@ -1,7 +1,7 @@
 <#
   setup-minipc-win11.ps1 — RUN AS ADMIN (PowerShell 5.1)
   Menu-driven provisioning for your mini-PCs.
-  Choose only what you want each run (installs, PLC NIC, updates hardening, etc).
+  Pick only what you want each run (installs, PLC NIC, updates hardening, etc).
 #>
 
 param([switch]$Resume)
@@ -32,7 +32,7 @@ function Report($msg){ $Global:ChangeReport += $msg; WriteLog $msg }
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){ Write-Error "Run this script as Administrator."; exit 1 }
 
-# ====== HELPERS (network, download, etc.) ======
+# ====== HELPERS ======
 function Wait-Network([int]$TimeoutSec=120){
   $sw=[Diagnostics.Stopwatch]::StartNew()
   while($sw.Elapsed.TotalSeconds -lt $TimeoutSec){
@@ -56,8 +56,8 @@ function Test-InstallerMagic([string]$Path){
     $fs=[IO.File]::Open($Path,'Open','Read','Read'); $br=New-Object IO.BinaryReader($fs)
     $b=$br.ReadBytes(8); $br.Dispose(); $fs.Dispose()
     if($b.Length -lt 2){return $false}
-    if($b[0] -eq 0x4D -and $b[1] -eq 0x5A){return $true} # EXE
-    if($b.Length -ge 8 -and $b[0]-eq 0xD0 -and $b[1]-eq 0xCF -and $b[2]-eq 0x11 -and $b[3]-eq 0xE0 -and $b[4]-eq 0xA1 -and $b[5]-eq 0xB1 -and $b[6]-eq 0x1A -and $b[7]-eq 0xE1){return $true} # MSI
+    if($b[0] -eq 0x4D -and $b[1] -eq 0x5A){return $true}
+    if($b.Length -ge 8 -and $b[0]-eq 0xD0 -and $b[1]-eq 0xCF -and $b[2]-eq 0x11 -and $b[3]-eq 0xE0 -and $b[4]-eq 0xA1 -and $b[5]-eq 0xB1 -and $b[6]-eq 0x1A -and $b[7]-eq 0xE1){return $true}
   }catch{}
   return $false
 }
@@ -91,7 +91,7 @@ function Download-GoogleDrive([string]$ShareUrl,[string]$DestinationPath,[int]$T
       elseif($html -match 'name="confirm"\s+value="([0-9A-Za-z_-]+)"'){ $token=$Matches[1] }
       elseif($html -match 'href="[^"]*?confirm=([0-9A-Za-z_-]+)[^"]*"'){ $token=$Matches[1] }
     }
-    if(-not $token){ throw "No Drive confirm token (permissions/quota?)" }
+    if(-not $token){ throw "No Drive confirm token" }
     Invoke-WebRequest -UseBasicParsing -Uri "$base&confirm=$token" -WebSession $sess -OutFile $DestinationPath -Headers $headers -TimeoutSec $TimeoutSec
   }
   if(-not (Test-Path $DestinationPath)){ throw "No file" }
@@ -117,9 +117,9 @@ function Get-FromSources([string]$LocalName,[string[]]$Sources,[int]$MinBytes=1M
   }
   throw ("All sources failed for $LocalName")
 }
-function Try-Run($sb,$desc){ try{ & $sb; Report "OK: $desc" } catch{ WriteLog ("ERR: {0} :: {1}" -f $desc,$_.Exception.Message); Write-Warning "Failed: $desc -> $($_.Exception.Message)"; $Global:ChangeReport += "FAILED: $desc ($($_.Exception.Message))" } }
+function Try-Run($sb,$desc){ try{ & $sb; Report ("OK: {0}" -f $desc) } catch{ WriteLog ("ERR: {0} :: {1}" -f $desc,$_.Exception.Message); Write-Warning ("Failed: {0} -> {1}" -f $desc,$_.Exception.Message); $Global:ChangeReport += ("FAILED: {0} ({1})" -f $desc,$_.Exception.Message) } }
 
-# ====== APPS/FEATURE DETECTION ======
+# ====== DETECTION ======
 function Test-ChromeInstalled {
   $paths=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe","$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe")
   if($paths | Where-Object{Test-Path $_}){return $true}
@@ -128,7 +128,7 @@ function Test-ChromeInstalled {
   return $false
 }
 
-# ====== RESUME TASK (for reboot after rename/DPI) ======
+# ====== RESUME TASK ======
 function Create-ResumeTask([string]$ScriptPath){
   $escaped=$ScriptPath.Replace('"','\"')
   $action="powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$escaped`" -Resume"
@@ -180,7 +180,7 @@ function Set-PLCAdapter {
   Set-NetConnectionProfile -InterfaceAlias $alias -NetworkCategory Private -ErrorAction SilentlyContinue
   Disable-NetAdapterBinding -Name $alias -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
   Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses
-  Report "PLC NIC '$alias' set to $IPAddress/$Prefix (no gateway, DNS empty)."
+  Report ("PLC NIC '{0}' set to {1}/{2} (no gateway, DNS empty)." -f $alias,$IPAddress,$Prefix)
 }
 
 # ====== EDGE SUPPRESSION & CHROME PIN (SHELL VERBS) ======
@@ -211,7 +211,7 @@ function Hide-Edge-And-Pin-Chrome {
   if ($p1 -or $p2) { Report "Chrome pinned to taskbar." } else { $Global:ChangeReport += "FAILED: Could not pin Chrome (verb not found?)." }
 }
 
-# ====== ACTIONS (callable by menu) ======
+# ====== ACTIONS ======
 function Act-RenameAndDPI {
   $DesiredComputerName = Read-Host "Enter computer name (blank keeps $env:COMPUTERNAME)"
   $needReboot=$false
@@ -227,7 +227,6 @@ function Act-RenameAndDPI {
     Restart-Computer -Force
   }
 }
-
 function Act-InstallChrome {
   if (Test-ChromeInstalled) { Report "Chrome already installed." }
   else {
@@ -235,22 +234,23 @@ function Act-InstallChrome {
     else { Try-Run { $chrome = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_MSI); Start-Process msiexec.exe -ArgumentList "/i `"$chrome`" /qn /norestart" -Wait } "Install Chrome (MSI)" }
   }
 }
-
 function Act-InstallCRD {
   Try-Run {
     $crdLocal = $null
     try { $crdLocal = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI) } catch {}
     if (-not $crdLocal) {
       $target = Join-Path $env:USERPROFILE 'Downloads\chromeremotedesktophost.msi'
-      [void](Open-ManualAndWait -UrlPrimary $FALLBACK_CRD_MSI -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message "Download CRD Host and save as: $target . Script continues when it appears." -TargetPath $target)
-      if (Test-Path $target) { $crdLocal = $target }
+      $null = Read-Host "Open will start in Chrome; save the MSI as $target then press ENTER."
+      Start-Process "chrome.exe" $FALLBACK_CRD_MSI | Out-Null
+      Start-Process "chrome.exe" $GDRIVE_FOLDER_ROOT | Out-Null
+      while(-not (Test-Path $target)){ Start-Sleep 5 }
+      $crdLocal = $target
     }
     if ($crdLocal) { Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$crdLocal`" /qn /norestart" -Wait -NoNewWindow }
     $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
     if (Test-Path $hostExe) { Report "CRD Host installed." } else { $Global:ChangeReport += "ACTION NEEDED: Finish CRD host install in browser."; Start-Process "chrome.exe" "--new-window https://remotedesktop.google.com/access" | Out-Null }
   } "Install Chrome Remote Desktop Host"
 }
-
 function Act-InstallPython {
   function Test-Python { (Get-Command python -ErrorAction SilentlyContinue) -or (Get-Command py -ErrorAction SilentlyContinue) }
   if (Test-Python) { Report "Python already present." }
@@ -258,13 +258,12 @@ function Act-InstallPython {
     Try-Run {
       $py = $null
       try { $py = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE) } catch {}
-      if (-not $py) { [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Download Python 3.x (64-bit) and run it. Press ENTER here when done.") }
+      if (-not $py) { Start-Process "chrome.exe" "https://www.python.org/downloads/windows/"; Read-Host "Download Python 3.x (64-bit), run it, then press ENTER" }
       else { Start-Process -FilePath $py -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait -NoNewWindow }
       if (Test-Python) { Report "Python installed and in PATH." } else { $Global:ChangeReport += "FAILED: Python not detected after attempt." }
     } "Install Python"
   }
 }
-
 function Act-InstallMEB {
   Try-Run {
     function Test-MEBFile([string]$p){ if (-not (Test-Path $p)) { return $false }; ((Get-Item $p).Length -ge 450MB) -and (Test-InstallerMagic $p) }
@@ -275,7 +274,10 @@ function Act-InstallMEB {
     }
     if (-not $meb) {
       $target = Join-Path $env:USERPROFILE 'Downloads\MachineExpertBasic_Setup.exe'
-      [void](Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message "Download from Drive and save as: $target . Script continues when it appears." -TargetPath $target)
+      Start-Process "chrome.exe" $GDRIVE_MEB_EXE | Out-Null
+      Start-Process "chrome.exe" $GDRIVE_FOLDER_ROOT | Out-Null
+      $null = Read-Host ("Save as {0}, then press ENTER" -f $target)
+      while(-not (Test-Path $target)){ Start-Sleep 5 }
       if (Test-MEBFile $target){ $meb=$target }
     }
     if (-not $meb){ throw "Machine Expert EXE not available" }
@@ -284,7 +286,6 @@ function Act-InstallMEB {
     Report "Machine Expert Basic installed (or launched for manual install)."
   } "Install Machine Expert Basic"
 }
-
 function Act-PowerAlwaysOn {
   Try-Run {
     powercfg /HIBERNATE OFF
@@ -297,7 +298,6 @@ function Act-PowerAlwaysOn {
     powercfg -SetActive SCHEME_CURRENT
   } "Keep system awake"
 }
-
 function Act-DisableWindowsUpdate {
   Try-Run {
     New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Force | Out-Null
@@ -317,7 +317,6 @@ function Act-DisableWindowsUpdate {
     foreach($tp in $taskPaths){ $tasks=Get-ScheduledTask -TaskPath $tp -ErrorAction SilentlyContinue; foreach($t in $tasks){ try{ Disable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue }catch{} } }
   } "Halt Windows Update (services + policies + tasks)"
 }
-
 function Act-DisableOneDrive {
   Try-Run {
     $envSys = "$env:SystemRoot\System32\OneDriveSetup.exe"
@@ -337,7 +336,6 @@ function Act-DisableOneDrive {
     Remove-Item "$env:ProgramData\Microsoft OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
   } "OneDrive removed and disabled"
 }
-
 function Act-EdgeOffChromeOn { Try-Run { Hide-Edge-And-Pin-Chrome } "Taskbar: pin Chrome, unpin Edge" }
 function Act-OpenDefaultApps { Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized } "Open Default Apps settings" }
 function Act-ChromeSignIn    { Try-Run { Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"; Read-Host "Sign into Chrome, then press ENTER here" } "Chrome account sign-in prompt" }
@@ -346,32 +344,27 @@ function Act-CRDFirewall     { Try-Run { $exe="$env:ProgramFiles\Google\Chrome R
 
 # ====== MENU ======
 $menuItems = @(
-  @{k='1'; t='Rename computer / DPI / ClearType';          f={ Act-RenameAndDPI } }
-  @{k='2'; t='Install Chrome';                             f={ Act-InstallChrome } }
-  @{k='3'; t='Install Chrome Remote Desktop Host';         f={ Act-InstallCRD } }
-  @{k='4'; t='Install Python (3.x)';                       f={ Act-InstallPython } }
-  @{k='5'; t='Install Machine Expert Basic';               f={ Act-InstallMEB } }
-  @{k='6'; t='Power: keep system always on';               f={ Act-PowerAlwaysOn } }
-  @{k='7'; t='Disable Windows Update (services+tasks)';    f={ Act-DisableWindowsUpdate } }
-  @{k='8'; t='Remove/disable OneDrive';                    f={ Act-DisableOneDrive } }
-  @{k='9'; t='Taskbar: unpin Edge + pin Chrome';           f={ Act-EdgeOffChromeOn } }
-  @{k='A'; t='Open Default Apps page (set Chrome)';        f={ Act-OpenDefaultApps } }
-  @{k='B'; t='Prompt Chrome sign-in';                      f={ Act-ChromeSignIn } }
-  @{k='C'; t='Configure PLC NIC (rename + static IP)';     f={ Act-PLCSetup } }
-  @{k='D'; t='CRD firewall + open access page';            f={ Act-CRDFirewall } }
-  @{k='Z'; t='Run a sensible minimal profile (6,7,8,9,C)'; f={
-        Act-PowerAlwaysOn; Act-DisableWindowsUpdate; Act-DisableOneDrive; Act-EdgeOffChromeOn; Act-PLCSetup
-     } }
-  @{k='Y'; t='Run full provisioning (2→5,6,7,8,9,C,D)';    f={
-        Act-InstallChrome; Act-InstallCRD; Act-InstallPython; Act-InstallMEB;
-        Act-PowerAlwaysOn; Act-DisableWindowsUpdate; Act-DisableOneDrive; Act-EdgeOffChromeOn; Act-PLCSetup; Act-CRDFirewall
-     } }
+  @{ k='1'; t='Rename computer / DPI / ClearType';          f={ Act-RenameAndDPI } }
+  @{ k='2'; t='Install Chrome';                             f={ Act-InstallChrome } }
+  @{ k='3'; t='Install Chrome Remote Desktop Host';         f={ Act-InstallCRD } }
+  @{ k='4'; t='Install Python (3.x)';                       f={ Act-InstallPython } }
+  @{ k='5'; t='Install Machine Expert Basic';               f={ Act-InstallMEB } }
+  @{ k='6'; t='Power: keep system always on';               f={ Act-PowerAlwaysOn } }
+  @{ k='7'; t='Disable Windows Update (services+tasks)';    f={ Act-DisableWindowsUpdate } }
+  @{ k='8'; t='Remove/disable OneDrive';                    f={ Act-DisableOneDrive } }
+  @{ k='9'; t='Taskbar: unpin Edge + pin Chrome';           f={ Act-EdgeOffChromeOn } }
+  @{ k='A'; t='Open Default Apps page (set Chrome)';        f={ Act-OpenDefaultApps } }
+  @{ k='B'; t='Prompt Chrome sign-in';                      f={ Act-ChromeSignIn } }
+  @{ k='C'; t='Configure PLC NIC (rename + static IP)';     f={ Act-PLCSetup } }
+  @{ k='D'; t='CRD firewall + open access page';            f={ Act-CRDFirewall } }
+  @{ k='Z'; t='Run minimal profile: 6,7,8,9,C';             f={ Act-PowerAlwaysOn; Act-DisableWindowsUpdate; Act-DisableOneDrive; Act-EdgeOffChromeOn; Act-PLCSetup } }
+  @{ k='Y'; t='Run full provisioning: 2,3,4,5,6,7,8,9,C,D'; f={ Act-InstallChrome; Act-InstallCRD; Act-InstallPython; Act-InstallMEB; Act-PowerAlwaysOn; Act-DisableWindowsUpdate; Act-DisableOneDrive; Act-EdgeOffChromeOn; Act-PLCSetup; Act-CRDFirewall } }
 )
 
 function Show-Menu {
   Clear-Host
   Write-Host "========== TTC MINI-PC PROVISIONER ==========" -ForegroundColor Cyan
-  Write-Host "Host: $env:COMPUTERNAME   User: $env:USERNAME" -ForegroundColor DarkGray
+  Write-Host ("Host: {0}   User: {1}" -f $env:COMPUTERNAME,$env:USERNAME) -ForegroundColor DarkGray
   Write-Host "Choose one or more options separated by commas (e.g., 2,3,9,C)."
   foreach($m in $menuItems){ Write-Host (" {0,-3} {1}" -f $m.k, $m.t) }
   Write-Host (" {0,-3} {1}" -f 'Q', 'Quit (show report)')
@@ -390,11 +383,10 @@ while($continue){
   $keys = $ans.Split(',') | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
   foreach($k in $keys){
     $item = $menuItems | Where-Object { $_.k -eq $k }
-    if ($item){ & $item.f } else { Write-Host "Unknown option: $k" -ForegroundColor Yellow }
+    if ($item){ & $item.f } else { Write-Host ("Unknown option: {0}" -f $k) -ForegroundColor Yellow }
   }
-  Read-Host "Press ENTER to return to menu (or type Q to finish)" | ForEach-Object {
-    if ($_ -and $_.Trim().ToUpper() -eq 'Q'){ $continue=$false }
-  }
+  $back = Read-Host "Press ENTER to return to menu (or type Q to finish)"
+  if ($back -and $back.Trim().ToUpper() -eq 'Q'){ $continue=$false }
 }
 
 # ====== FINAL SUMMARY ======
@@ -402,6 +394,6 @@ WriteLog "=== SESSION COMPLETE ==="
 Write-Host "`n=====================================" -ForegroundColor Cyan
 Write-Host "   MINI-PC PROVISIONING — SUMMARY" -ForegroundColor Green
 Write-Host "=====================================" -ForegroundColor Cyan
-$Global:ChangeReport | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
-Write-Host "`nDetailed log: $Log" -ForegroundColor DarkGray
-Write-Host "Finished on $(Get-Date)." -ForegroundColor Green
+$Global:ChangeReport | ForEach-Object { Write-Host (" - {0}" -f $_) -ForegroundColor White }
+Write-Host ("`nDetailed log: {0}" -f $Log) -ForegroundColor DarkGray
+Write-Host ("Finished on {0}." -f (Get-Date)) -ForegroundColor Green
