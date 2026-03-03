@@ -307,7 +307,8 @@ function Create-ResumeTask([string]$ScriptPath){
   if(-not (Test-Path $ScriptPath)){
     throw "Create-ResumeTask: Script not found at $ScriptPath"
   }
-  $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$ScriptPath' -Resume`""
+
+  $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '$ScriptPath' -Resume"""
 
   $user = "$env:USERDOMAIN\$env:USERNAME"
   $cmdUser = "schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
@@ -322,8 +323,8 @@ function Create-ResumeTask([string]$ScriptPath){
   }
 
   WriteLog "User resume task failed; trying SYSTEM ONLOGON"
-
   $cmdSys = "schtasks /Create /RU SYSTEM /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
+
   WriteLog "Creating resume task (system): $cmdSys"
   $out2 = cmd.exe /c $cmdSys 2>&1
   $out2 | ForEach-Object { WriteLog $_ }
@@ -334,6 +335,7 @@ function Create-ResumeTask([string]$ScriptPath){
 
   WriteLog "Resume task (SYSTEM) created"
 }
+
 function Remove-ResumeTask { try{ schtasks /Delete /TN $TaskName /F | Out-Null; WriteLog "Resume task removed" }catch{ WriteLog "No resume task to remove" } }
 
 # ====== Font smoothing (always-on ClearType) ======
