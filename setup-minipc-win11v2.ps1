@@ -646,35 +646,70 @@ function Resume-Phase {
     Report "Skipped: Python."
   }
 
-  # 5) Twido Suite
-  if($cfgObj.InstallTwido){
-    Try-Run {
+# 5) Twido Suite
+if($cfgObj.InstallTwido){
+  Try-Run {
+
+    function Test-TwidoZip([string]$p){
+      if (-not (Test-Path $p)) { return $false }
+      $len=((Get-Item $p).Length -ge 5MB)
+      $mag=(Test-ZipMagic $p)
+      return ($len -and $mag)
+    }
+
+    $zip = $null
+
+    # Attempt automatic download first
+    try {
       $zip = Get-FromSourcesZip -LocalName "TwidoSuite_V0220_11.zip" -Sources @($GDRIVE_TWIDO_ZIP) -MinBytes 5MB
+    } catch {
+      WriteLog "Twido auto-download failed."
+    }
 
-      $extractRoot = Join-Path $env:TEMP "TwidoSuite_V0220_11_extract"
-      if(Test-Path $extractRoot){ Remove-Item $extractRoot -Recurse -Force -ErrorAction SilentlyContinue }
-      New-Item -ItemType Directory -Path $extractRoot | Out-Null
-
-      Expand-Archive -Path $zip -DestinationPath $extractRoot -Force
-
-      $twidoDir = Get-ChildItem -Path $extractRoot -Directory -Recurse -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -ieq "TwidoSuite_V0220_11" } |
-                  Select-Object -First 1
-      if(-not $twidoDir){ $twidoDir = Get-Item $extractRoot }
-
-      $setup = Join-Path $twidoDir.FullName "setup.exe"
-      if(-not (Test-Path $setup)){
-        $hit = Get-ChildItem -Path $extractRoot -Filter "setup.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if($hit){ $setup = $hit.FullName }
+    # Check common locations if download failed
+    if (-not $zip) {
+      foreach($c in @(
+        (Join-Path $env:USERPROFILE 'Downloads\TwidoSuite_V0220_11.zip'),
+        (Join-Path $env:USERPROFILE 'Desktop\TwidoSuite_V0220_11.zip')
+      )){
+        if (Test-TwidoZip $c){ $zip=$c; break }
       }
-      if(-not $setup -or -not (Test-Path $setup)){ throw "Twido setup.exe not found after extracting ZIP." }
+    }
 
-      Start-Process -FilePath $setup -Wait
-      Report "Twido Suite installer launched (completed if installer ran to finish)."
-    } "Install Twido Suite"
-  } else {
-    Report "Skipped: Twido Suite."
-  }
+    # Manual fallback (same pattern as Machine Expert)
+    if (-not $zip) {
+      $target = Join-Path $env:USERPROFILE 'Downloads\TwidoSuite_V0220_11.zip'
+      $msg = "Drive will open. Click 'Download anyway' and save as: $target . Script continues when file appears."
+      [void](Open-ManualAndWait -UrlPrimary $GDRIVE_TWIDO_ZIP -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
+
+      if (Test-TwidoZip $target){ $zip=$target }
+    }
+
+    if (-not $zip){ throw "Twido ZIP not available" }
+
+    $extractRoot = Join-Path $env:TEMP "TwidoSuite_V0220_11_extract"
+
+    if(Test-Path $extractRoot){
+      Remove-Item $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    New-Item -ItemType Directory -Path $extractRoot | Out-Null
+
+    Expand-Archive -Path $zip -DestinationPath $extractRoot -Force
+
+    $setup = Get-ChildItem -Path $extractRoot -Filter "setup.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if(-not $setup){ throw "Twido setup.exe not found after extracting ZIP." }
+
+    Start-Process -FilePath $setup.FullName -Wait
+
+    Report "Twido Suite installer launched."
+
+  } "Install Twido Suite"
+
+} else {
+  Report "Skipped: Twido Suite."
+}
 
   # 6) Machine Expert Basic
   if($cfgObj.InstallMachineExp){
