@@ -52,7 +52,12 @@ $ConfigPath = Join-Path $Here "setup-mini-pc.config.json"
 function WriteLog($m){ $m | Out-File -FilePath $Log -Append -Encoding utf8; Write-Host $m }
 $Global:ChangeReport = @()
 function Report($msg){ $Global:ChangeReport += $msg; WriteLog $msg }
-
+WriteLog "PSCommandPath: $PSCommandPath"
+WriteLog "MyInvocation.Path: $($MyInvocation.MyCommand.Path)"
+WriteLog "Here: $Here"
+WriteLog "Log: $Log"
+WriteLog "ConfigPath: $ConfigPath"
+WriteLog "User: $env:USERDOMAIN\$env:USERNAME"
 # Admin check
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
@@ -298,13 +303,36 @@ function Test-ChromeInstalled {
 
 # Scheduled-task helpers
 function Create-ResumeTask([string]$ScriptPath){
-  $escaped=$ScriptPath.Replace('"','\"')
-  $action="powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$escaped`" -Resume"
-  $user="$env:USERDOMAIN\$env:USERNAME"
-  $cmdUser="schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
-  try{ cmd.exe /c $cmdUser | Out-Null; WriteLog "Resume task (user) created"; return }catch{ WriteLog "User resume task failed; trying SYSTEM" }
-  $cmdSys="schtasks /Create /RU SYSTEM /RL HIGHEST /SC ONSTART /TN `"$TaskName`" /TR `"$action`" /F"
-  cmd.exe /c $cmdSys | Out-Null; WriteLog "Resume task (SYSTEM) created"
+
+  if(-not (Test-Path $ScriptPath)){
+    throw "Create-ResumeTask: Script not found at $ScriptPath"
+  }
+  $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$ScriptPath' -Resume`""
+
+  $user = "$env:USERDOMAIN\$env:USERNAME"
+  $cmdUser = "schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
+
+  WriteLog "Creating resume task (user): $cmdUser"
+  $out = cmd.exe /c $cmdUser 2>&1
+  $out | ForEach-Object { WriteLog $_ }
+
+  if($LASTEXITCODE -eq 0){
+    WriteLog "Resume task (user) created"
+    return
+  }
+
+  WriteLog "User resume task failed; trying SYSTEM ONLOGON"
+
+  $cmdSys = "schtasks /Create /RU SYSTEM /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
+  WriteLog "Creating resume task (system): $cmdSys"
+  $out2 = cmd.exe /c $cmdSys 2>&1
+  $out2 | ForEach-Object { WriteLog $_ }
+
+  if($LASTEXITCODE -ne 0){
+    throw "SYSTEM resume task creation failed with exit code $LASTEXITCODE"
+  }
+
+  WriteLog "Resume task (SYSTEM) created"
 }
 function Remove-ResumeTask { try{ schtasks /Delete /TN $TaskName /F | Out-Null; WriteLog "Resume task removed" }catch{ WriteLog "No resume task to remove" } }
 
@@ -447,8 +475,25 @@ if(-not $Resume){
   Try-Run { Ensure-ClearType } "Enable ClearType (font smoothing)"
 
   if ($needReboot){
-    $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+    $stableDir = "C:\ProgramData\Trivial"
+    New-Item -ItemType Directory -Path $stableDir -Force | Out-Null
+  
+    $currentScript = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+    if (-not $currentScript) { throw "Cannot determine current script path for resume." }
+  
+    $stableScript = Join-Path $stableDir "setup-minipc-win11v2.ps1"
+    Copy-Item -Path $currentScript -Destination $stableScript -Force
+    Unblock-File -Path $stableScript -ErrorAction SilentlyContinue
+    if (Test-Path $ConfigPath) {
+      Copy-Item -Path $ConfigPath -Destination (Join-Path $stableDir "setup-mini-pc.config.json") -Force
+    }
+    $scriptPath  = $stableScript
+    $Here        = $stableDir
+    $Log         = Join-Path $Here "setup-mini-pc.log"
+    $ConfigPath  = Join-Path $Here "setup-mini-pc.config.json"
+  
     Try-Run { Create-ResumeTask -ScriptPath $scriptPath } "Create resume task"
+  
     Write-Host "Rebooting to apply changes… (script will auto-resume)" -ForegroundColor Yellow
     Restart-Computer -Force
     exit 0
@@ -724,9 +769,5 @@ function Resume-Phase {
   Write-Host "Finished on $(Get-Date)." -ForegroundColor Green
 }
 
-Resume-Phase
-WriteLog "Done: $(Get-Date)"
-
-# Run resume-phase now
 Resume-Phase
 WriteLog "Done: $(Get-Date)"
