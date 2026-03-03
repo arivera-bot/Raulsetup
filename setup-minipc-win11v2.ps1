@@ -1,5 +1,5 @@
 <#
-  setup-minipc-win11.ps2 — RUN AS ADMIN (PowerShell 5.1)
+  setup-minipc-win11v2.ps1 — RUN AS ADMIN (PowerShell 5.1)
 
   Purpose: install selected apps, keep system always-on, halt Windows Update,
            remove/disable OneDrive, suppress Edge + pin Chrome,
