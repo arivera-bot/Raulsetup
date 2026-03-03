@@ -519,8 +519,9 @@ if(-not $Resume){
     $stableScript = Join-Path $stableDir "setup-minipc-win11v2.ps1"
     Copy-Item -Path $currentScript -Destination $stableScript -Force
     Unblock-File -Path $stableScript -ErrorAction SilentlyContinue
-    if (Test-Path $ConfigPath) {
-      Copy-Item -Path $ConfigPath -Destination (Join-Path $stableDir "setup-mini-pc.config.json") -Force
+    $destConfig = Join-Path $stableDir "setup-mini-pc.config.json"
+    if ((Test-Path $ConfigPath) -and ($ConfigPath -ne $destConfig)) {
+      Copy-Item -Path $ConfigPath -Destination $destConfig -Force
     }
     $scriptPath  = $stableScript
     $Here        = $stableDir
