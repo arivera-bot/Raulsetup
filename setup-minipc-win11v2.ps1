@@ -43,13 +43,25 @@ $FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-a
 $TaskName = "ProvisionMiniPC_AutoResume"
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path; if (-not $Here) { $Here = $env:TEMP }
-$Log  = Join-Path $Here "setup-mini-pc.log"
+$StableDir = "C:\ProgramData\Trivial"
+New-Item -ItemType Directory -Path $StableDir -Force | Out-Null
+
+$Here       = $StableDir
+$Log        = Join-Path $Here "setup-mini-pc.log"
 $ConfigPath = Join-Path $Here "setup-mini-pc.config.json"
 
-"=== Run: $(Get-Date) on $env:COMPUTERNAME (Resume=$Resume) ===" | Out-File $Log -Append -Encoding utf8
+"=== Run: $(Get-Date) on $env:COMPUTERNAME (Resume=$Resume) ===" | Out-File $Log -Append -Encoding utf8 -Force
 
-function WriteLog($m){ $m | Out-File -FilePath $Log -Append -Encoding utf8; Write-Host $m }
+function WriteLog($m){
+  try {
+    $m | Out-File -FilePath $Log -Append -Encoding utf8 -Force
+  } catch {
+    # fallback if something weird happens with $Log permissions
+    $fallback = Join-Path $env:TEMP "setup-mini-pc.fallback.log"
+    $m | Out-File -FilePath $fallback -Append -Encoding utf8 -Force
+  }
+  Write-Host $m
+}
 $Global:ChangeReport = @()
 function Report($msg){ $Global:ChangeReport += $msg; WriteLog $msg }
 WriteLog "PSCommandPath: $PSCommandPath"
