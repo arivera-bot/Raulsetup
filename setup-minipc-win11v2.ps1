@@ -319,8 +319,7 @@ function Create-ResumeTask([string]$ScriptPath){
   if(-not (Test-Path $ScriptPath)){
     throw "Create-ResumeTask: Script not found at $ScriptPath"
   }
-
-  $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '$ScriptPath' -Resume"""
+  $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -Resume"
 
   $user = "$env:USERDOMAIN\$env:USERNAME"
   $cmdUser = "schtasks /Create /RU `"$user`" /RL HIGHEST /SC ONLOGON /TN `"$TaskName`" /TR `"$action`" /F"
@@ -430,18 +429,40 @@ function Hide-Edge-And-Pin-Chrome {
 
   $edge = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
   if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+
   $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
   if (-not (Test-Path $chrome)) { $chrome = "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe" }
 
-  $u1 = Invoke-ShellVerb -Path $edge   -VerbMatch "Unpin from taskbar"; Start-Sleep 1
-  $p1 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar";      Start-Sleep 1
-  Refresh-Explorer; Start-Sleep 2
-  $u2 = Invoke-ShellVerb -Path $edge   -VerbMatch "Unpin from taskbar"
-  $p2 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar"
+  # Try once
+  $u1 = Invoke-ShellVerb -Path $edge -VerbMatch "Unpin from taskbar"
+  Start-Sleep 1
+
+  $p1 = $false
+  if (Test-Path $chrome) {
+    $p1 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar"
+    Start-Sleep 1
+  } else {
+    WriteLog "NOTE: Chrome exe not found; skipping pin."
+  }
+
+  # Restart Explorer and try again (sometimes verbs appear/disappear)
+  Refresh-Explorer
+  Start-Sleep 2
+
+  $u2 = Invoke-ShellVerb -Path $edge -VerbMatch "Unpin from taskbar"
+
+  $p2 = $false
+  if (Test-Path $chrome) {
+    $p2 = Invoke-ShellVerb -Path $chrome -VerbMatch "Pin to taskbar"
+  }
+
   Refresh-Explorer
 
-  if ($u1 -or $u2) { Report "Edge unpinned from taskbar." } else { $Global:ChangeReport += "NOTE: Edge might already be unpinned (verb missing)." }
-  if ($p1 -or $p2) { Report "Chrome pinned to taskbar." } else { $Global:ChangeReport += "FAILED: Could not pin Chrome (verb not found?)." }
+  if ($u1 -or $u2) { Report "Edge unpinned from taskbar." }
+  else { $Global:ChangeReport += "NOTE: Edge might already be unpinned (verb missing)." }
+
+  if ($p1 -or $p2) { Report "Chrome pinned to taskbar." }
+  else { $Global:ChangeReport += "FAILED: Could not pin Chrome (verb not found?)." }
 }
 
 # ====== Stage A: gather choices + rename + optional DPI + ClearType ======
