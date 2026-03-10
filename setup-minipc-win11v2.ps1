@@ -685,7 +685,7 @@ if($cfgObj.InstallTwido){
 
     if (-not $zip){ throw "Twido ZIP not available" }
 
-    $extractRoot = Join-Path $env:TEMP "TwidoSuite_V0220_11_extract"
+    $extractRoot = Join-Path $env:TEMP "TwidoSuite.2.33.MultiLanguages_extract"
 
     if(Test-Path $extractRoot){
       Remove-Item $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -695,9 +695,9 @@ if($cfgObj.InstallTwido){
 
     Expand-Archive -Path $zip -DestinationPath $extractRoot -Force
 
-    $setup = Get-ChildItem -Path $extractRoot -Filter "setup.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $setup = Get-ChildItem -Path $extractRoot -Filter "TwidoSuiteInstaller.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
-    if(-not $setup){ throw "Twido setup.exe not found after extracting ZIP." }
+    if(-not $setup){ throw "TwidoSuiteInstaller.exe not found after extracting ZIP." }
 
     Start-Process -FilePath $setup.FullName -Wait
 
