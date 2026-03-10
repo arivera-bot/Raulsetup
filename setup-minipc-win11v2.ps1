@@ -25,13 +25,11 @@
 
 param([switch]$Resume)
 
-# ====== YOUR LINKS ======
+# ====== LINKS ======
 $GDRIVE_PY_EXE      = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
-$GDRIVE_MEB_EXE     = "https://drive.google.com/file/d/1CfLdcXN1DqRZDGCWsPxpo3XFS7kbmMrN/view?usp=sharing"
+$GDRIVE_MEB_EXE     = "https://drive.google.com/file/d/1_-YOGugROM57rIpOz0ODy8EBL8AuR0X-/view?usp=sharing"
 $GDRIVE_CRD_MSI     = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGnyV-X4qPQqeDr0-D8?usp=drive_link"
-
-# Twido (ZIP)
 $GDRIVE_TWIDO_ZIP   = "https://drive.google.com/file/d/1dIkXGcRuZ_RcfRf7YAn-OSIlKqFE6-xJ/view?usp=sharing"
 
 # Public fallbacks
