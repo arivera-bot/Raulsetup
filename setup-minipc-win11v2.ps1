@@ -30,7 +30,7 @@ $GDRIVE_PY_EXE      = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3Afmnn
 $GDRIVE_MEB_EXE     = "https://drive.google.com/file/d/1_-YOGugROM57rIpOz0ODy8EBL8AuR0X-/view?usp=sharing"
 $GDRIVE_CRD_MSI     = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
 $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGnyV-X4qPQqeDr0-D8?usp=drive_link"
-$GDRIVE_TWIDO_ZIP   = "https://drive.google.com/file/d/1dIkXGcRuZ_RcfRf7YAn-OSIlKqFE6-xJ/view?usp=sharing"
+$GDRIVE_TWIDO_ZIP   = "https://drive.google.com/file/d/1PnXn2OLx4FmYFxn7qAgNHrVZoi5FlVeC/view?usp=sharing"
 
 # Public fallbacks
 $FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
@@ -659,7 +659,7 @@ if($cfgObj.InstallTwido){
 
     # Attempt automatic download first
     try {
-      $zip = Get-FromSourcesZip -LocalName "TwidoSuite_V0220_11.zip" -Sources @($GDRIVE_TWIDO_ZIP) -MinBytes 5MB
+      $zip = Get-FromSourcesZip -LocalName "TwidoSuite.2.33.MultiLanguages.zip" -Sources @($GDRIVE_TWIDO_ZIP) -MinBytes 5MB
     } catch {
       WriteLog "Twido auto-download failed."
     }
@@ -667,8 +667,8 @@ if($cfgObj.InstallTwido){
     # Check common locations if download failed
     if (-not $zip) {
       foreach($c in @(
-        (Join-Path $env:USERPROFILE 'Downloads\TwidoSuite_V0220_11.zip'),
-        (Join-Path $env:USERPROFILE 'Desktop\TwidoSuite_V0220_11.zip')
+        (Join-Path $env:USERPROFILE 'Downloads\TwidoSuite.2.33.MultiLanguages.zip'),
+        (Join-Path $env:USERPROFILE 'Desktop\TwidoSuite.2.33.MultiLanguages.zip')
       )){
         if (Test-TwidoZip $c){ $zip=$c; break }
       }
@@ -676,7 +676,7 @@ if($cfgObj.InstallTwido){
 
     # Manual fallback (same pattern as Machine Expert)
     if (-not $zip) {
-      $target = Join-Path $env:USERPROFILE 'Downloads\TwidoSuite_V0220_11.zip'
+      $target = Join-Path $env:USERPROFILE 'Downloads\TwidoSuite.2.33.MultiLanguages.zip'
       $msg = "Drive will open. Click 'Download anyway' and save as: $target . Script continues when file appears."
       [void](Open-ManualAndWait -UrlPrimary $GDRIVE_TWIDO_ZIP -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
 
