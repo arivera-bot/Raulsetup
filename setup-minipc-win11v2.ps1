@@ -475,7 +475,9 @@ function Ensure-Python {
         return "python"
     }
 
-    $pythonInstaller = $null    try {
+    $pythonInstaller = $null    
+    
+    try {
         $pythonInstaller = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE) -Kind Installer
     }
     catch {
