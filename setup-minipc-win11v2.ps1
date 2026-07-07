@@ -1,4 +1,3 @@
-
 <#
 Install-RAUL-Full-Setup.ps1
 
@@ -331,6 +330,45 @@ function Get-FromSources {
     throw "All sources failed for $LocalName"
 }
 
+function Get-ManualDriveDownload {
+    param(
+        [string]$LocalName,
+        [string]$DriveUrl,
+        [string]$FriendlyName,
+        [ValidateSet("Installer","Zip")][string]$Kind = "Installer"
+    )
+
+    $target = Join-Path $env:USERPROFILE "Downloads\$LocalName"
+
+    foreach ($candidate in @(
+        (Join-Path $env:USERPROFILE "Downloads\$LocalName"),
+        (Join-Path $env:USERPROFILE "Desktop\$LocalName")
+    )) {
+        if ($Kind -eq "Installer" -and (Test-Path $candidate) -and (Test-InstallerMagic $candidate)) {
+            WriteLog "Using existing $FriendlyName download: $candidate"
+            return $candidate
+        }
+        if ($Kind -eq "Zip" -and (Test-Path $candidate) -and (Test-ZipMagic $candidate)) {
+            WriteLog "Using existing $FriendlyName download: $candidate"
+            return $candidate
+        }
+    }
+
+    $msg = "All automatic $FriendlyName downloads failed. Drive will open. Download $FriendlyName and save it as: $target. The script continues when the file appears."
+    [void](Open-ManualAndWait -UrlPrimary $DriveUrl -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
+
+    if ($Kind -eq "Installer" -and (Test-Path $target) -and (Test-InstallerMagic $target)) {
+        WriteLog "Detected manual $FriendlyName download: $target"
+        return $target
+    }
+    if ($Kind -eq "Zip" -and (Test-Path $target) -and (Test-ZipMagic $target)) {
+        WriteLog "Detected manual $FriendlyName download: $target"
+        return $target
+    }
+
+    return $null
+}
+
 function Open-ManualAndWait {
     param(
         [string]$UrlPrimary,
@@ -497,10 +535,7 @@ function Install-ChromeRemoteDesktop {
     }
 
     if (-not $crdLocal) {
-        $target = Join-Path $env:USERPROFILE "Downloads\chromeremotedesktophost.msi"
-        $msg = "Download Chrome Remote Desktop Host and save it as: $target. The script will continue when the file appears."
-        [void](Open-ManualAndWait -UrlPrimary $FALLBACK_CRD_MSI -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
-        if (Test-Path $target) { $crdLocal = $target }
+        $crdLocal = Get-ManualDriveDownload -LocalName "chromeremotedesktophost.msi" -DriveUrl $GDRIVE_CRD_MSI -FriendlyName "Chrome Remote Desktop Host" -Kind Installer
     }
 
     if ($crdLocal) {
@@ -599,6 +634,20 @@ function Ensure-Python {
     }
 
     if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
+        foreach ($candidate in @(
+            (Join-Path $env:USERPROFILE "Downloads\python-3.13.7-amd64.exe"),
+            (Join-Path $env:USERPROFILE "Desktop\python-3.13.7-amd64.exe")
+        )) {
+            if ((Test-Path $candidate) -and (Test-InstallerMagic $candidate)) {
+                Copy-Item -Path $candidate -Destination $pythonInstallerPath -Force
+                $pythonInstaller = $pythonInstallerPath
+                WriteLog "Using existing Python installer: $candidate"
+                break
+            }
+        }
+    }
+
+    if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
         try {
             WriteLog "Downloading Python from official fallback to $pythonInstallerPath"
             Invoke-WebRequest-Retry -Uri $FALLBACK_PY_EXE -OutFile $pythonInstallerPath | Out-Null
@@ -610,7 +659,16 @@ function Ensure-Python {
     }
 
     if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
-        [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Download and install Python 3.x 64-bit. IMPORTANT: check Add Python to PATH. Press ENTER here when finished.")
+        $manualPython = Get-ManualDriveDownload -LocalName "python-3.13.7-amd64.exe" -DriveUrl $GDRIVE_PY_EXE -FriendlyName "Python" -Kind Installer
+
+        if ($manualPython) {
+            Copy-Item -Path $manualPython -Destination $pythonInstallerPath -Force
+            $pythonInstaller = $pythonInstallerPath
+        }
+    }
+
+    if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
+        [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Drive/manual Python download was not detected. Download and install Python 3.x 64-bit manually. IMPORTANT: check Add Python to PATH. Press ENTER here when finished.")
     }
     else {
         Start-Process -FilePath $pythonInstaller -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_pip=1" -Wait -NoNewWindow
@@ -668,10 +726,7 @@ function Install-TwidoSuite {
     }
 
     if (-not $zip) {
-        $target = Join-Path $env:USERPROFILE "Downloads\TwidoSuite.2.33.MultiLanguages.zip"
-        $msg = "Drive will open. Download Twido and save it as: $target. The script continues when the file appears."
-        [void](Open-ManualAndWait -UrlPrimary $GDRIVE_TWIDO_ZIP -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
-        if ((Test-Path $target) -and (Test-ZipMagic $target)) { $zip = $target }
+        $zip = Get-ManualDriveDownload -LocalName "TwidoSuite.2.33.MultiLanguages.zip" -DriveUrl $GDRIVE_TWIDO_ZIP -FriendlyName "Twido Suite" -Kind Zip
     }
 
     if (-not $zip) { throw "Twido ZIP not available." }
@@ -712,10 +767,7 @@ function Install-MachineExpertBasic {
     }
 
     if (-not $installer) {
-        $target = Join-Path $env:USERPROFILE "Downloads\MachineExpertBasic_Setup.exe"
-        $msg = "Drive will open. Download Machine Expert Basic and save it as: $target. The script continues when the file appears."
-        [void](Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
-        if ((Test-Path $target) -and (Test-InstallerMagic $target)) { $installer = $target }
+        $installer = Get-ManualDriveDownload -LocalName "MachineExpertBasic_Setup.exe" -DriveUrl $GDRIVE_MEB_EXE -FriendlyName "Machine Expert Basic" -Kind Installer
     }
 
     if (-not $installer) { throw "Machine Expert Basic installer not available." }
@@ -981,7 +1033,24 @@ function Install-RaulApp {
     $zipPath = Join-Path $WorkDir "RAUL 2.0.zip"
     $extractTemp = Join-Path $WorkDir "raul_extract"
 
-    Download-GoogleDriveFile -ShareUrl $GDRIVE_RAUL_ZIP -DestinationPath $zipPath -MinBytes 1MB -Kind Zip | Out-Null
+    try {
+        Download-GoogleDriveFile -ShareUrl $GDRIVE_RAUL_ZIP -DestinationPath $zipPath -MinBytes 1MB -Kind Zip | Out-Null
+    }
+    catch {
+        WriteLog "RAUL ZIP auto-download failed: $($_.Exception.Message)"
+    }
+
+    if (-not ((Test-Path $zipPath) -and (Test-ZipMagic $zipPath))) {
+        $manualRaulZip = Get-ManualDriveDownload -LocalName "RAUL 2.0.zip" -DriveUrl $GDRIVE_RAUL_ZIP -FriendlyName "RAUL 2.0 ZIP" -Kind Zip
+
+        if ($manualRaulZip) {
+            Copy-Item -Path $manualRaulZip -Destination $zipPath -Force
+        }
+    }
+
+    if (-not ((Test-Path $zipPath) -and (Test-ZipMagic $zipPath))) {
+        throw "RAUL 2.0 ZIP was not downloaded or selected."
+    }
 
     if (Test-Path $extractTemp) { Remove-Item $extractTemp -Recurse -Force }
     New-Item -ItemType Directory -Path $extractTemp -Force | Out-Null
@@ -1221,3 +1290,4 @@ if ($needReboot) {
 
 Write-Host ""
 Read-Host "Press ENTER to close"
+
