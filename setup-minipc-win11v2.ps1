@@ -1,3 +1,4 @@
+
 <#
 Install-RAUL-Full-Setup.ps1
 
@@ -43,7 +44,7 @@ $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGny
 
 $FALLBACK_CHROME_MSI = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
-$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.13.7/python-3.13.7-amd64.exe"
 
 # ==================== PATHS ====================
 $StableDir = "C:\ProgramData\Trivial"
@@ -572,14 +573,43 @@ function Ensure-Python {
 
     $pythonInstaller = $null    
     
+    $pythonInstallerPath = Join-Path $WorkDir "python-3.13.7-amd64.exe"
+
     try {
-        $pythonInstaller = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE) -Kind Installer
+        $pythonInstaller = Get-FromSources -LocalName "python-3.13.7-amd64.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE) -Kind Installer
+
+        if ($pythonInstaller -and (Test-Path $pythonInstaller) -and ($pythonInstaller -ne $pythonInstallerPath)) {
+            Copy-Item -Path $pythonInstaller -Destination $pythonInstallerPath -Force
+            $pythonInstaller = $pythonInstallerPath
+        }
     }
     catch {
-        WriteLog "Python auto-download failed: $($_.Exception.Message)"
+        WriteLog "Python auto-download failed through source helper: $($_.Exception.Message)"
     }
 
-    if (-not $pythonInstaller) {
+    if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
+        try {
+            WriteLog "Downloading Python directly to $pythonInstallerPath"
+            Download-GoogleDriveFile -ShareUrl $GDRIVE_PY_EXE -DestinationPath $pythonInstallerPath -MinBytes 10MB -Kind Installer | Out-Null
+            $pythonInstaller = $pythonInstallerPath
+        }
+        catch {
+            WriteLog "Python Google Drive direct download failed: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
+        try {
+            WriteLog "Downloading Python from official fallback to $pythonInstallerPath"
+            Invoke-WebRequest-Retry -Uri $FALLBACK_PY_EXE -OutFile $pythonInstallerPath | Out-Null
+            $pythonInstaller = $pythonInstallerPath
+        }
+        catch {
+            WriteLog "Python official fallback download failed: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not ($pythonInstaller -and (Test-Path $pythonInstaller) -and (Test-InstallerMagic $pythonInstaller))) {
         [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Download and install Python 3.x 64-bit. IMPORTANT: check Add Python to PATH. Press ENTER here when finished.")
     }
     else {
