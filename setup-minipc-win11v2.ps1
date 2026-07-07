@@ -530,9 +530,29 @@ function Configure-ChromeRemoteDesktopFirewall {
     Report "Chrome Remote Desktop firewall rules checked and access page opened."
 }
 
+function Test-PythonCommand {
+    param([string]$PythonCommand)
+
+    try {
+        if ($PythonCommand -eq "py -3") {
+            $output = & py -3 --version 2>&1
+        }
+        else {
+            $output = & $PythonCommand --version 2>&1
+        }
+
+        if ($LASTEXITCODE -eq 0 -and ($output -join " ") -match "Python\s+3\.") {
+            return $true
+        }
+    }
+    catch {}
+
+    return $false
+}
+
 function Get-PythonCommand {
-    if (Get-Command python -ErrorAction SilentlyContinue) { return "python" }
-    if (Get-Command py -ErrorAction SilentlyContinue) { return "py -3" }
+    if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand "py -3")) { return "py -3" }
+    if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonCommand "python")) { return "python" }
     return $null
 }
 
@@ -543,9 +563,11 @@ function Refresh-Path {
 }
 
 function Ensure-Python {
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        Report "Python already available in PATH as: python"
-        return "python"
+    $existingPython = Get-PythonCommand
+
+    if ($existingPython) {
+        Report "Python already available as: $existingPython"
+        return $existingPython
     }
 
     $pythonInstaller = $null    
@@ -565,10 +587,10 @@ function Ensure-Python {
     }
 
     Refresh-Path
-    $pythonCommand = if (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { $null }
+    $pythonCommand = Get-PythonCommand
 
     if (-not $pythonCommand) {
-        throw "Python was not detected in PATH. Restart Windows, then run this script again."
+        throw "Real Python 3 was not detected. The Microsoft Store python alias does not count. Restart Windows, then run this script again."
     }
 
     Report "Python installed and available in PATH as: $pythonCommand"
@@ -585,7 +607,7 @@ function Invoke-Python {
         & py -3 @Arguments
     }
     else {
-        & python @Arguments
+        & $PythonCommand @Arguments
     }
 
     if ($LASTEXITCODE -ne 0) {
@@ -959,7 +981,7 @@ function Install-RaulApp {
     Update-RaulSettingsFile -Folder $manualFolder -TabName $TabName -ProjectName $ProjectName
     Update-RaulManualConfig -ManualFolder $manualFolder -TabName $TabName
     Install-RaulPythonPackages -PythonCommand $PythonCommand -DashFolder $dashFolder
-    Create-RaulStartupFile -PythonCommand "python" -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
+    Create-RaulStartupFile -PythonCommand $PythonCommand -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
 
     Report "RAUL 2.0 installed to $InstallRoot"
 }
@@ -1092,11 +1114,13 @@ if ($installPython) {
     $pythonCommand = Ensure-Python
 }
 else {
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $pythonCommand = "python"
+    $pythonCommand = Get-PythonCommand
+
+    if ($pythonCommand) {
+        Report "Using existing Python as: $pythonCommand"
     }
     else {
-        throw "Python is required for RAUL, but the python command was not found and Python install/check was skipped."
+        throw "Python is required for RAUL, but real Python 3 was not found and Python install/check was skipped."
     }
 }
 
