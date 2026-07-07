@@ -1,68 +1,184 @@
 <#
-Install-RAUL-2.0.ps1
+Install-RAUL-Full-Setup.ps1
 
-This single script:
-  1. Downloads RAUL 2.0.zip from Google Drive.
-  2. Extracts RAULDASH and RAULMANUAL.
-  3. Prompts for LocationLog/tab name and ProjectName.
-  4. Updates both settings XML files.
-  5. Updates RAULMANUAL raul_config tab_name.
-  6. Installs Python if it is missing.
-  7. Runs pip install -r requirements.txt from RAULDASH.
-  8. Installs Flask.
-  9. Creates a Windows startup BAT that starts both apps, selects option 5
-     in RAULDASH, and opens the first RAULMANUAL server URL.
+Run as Administrator on Windows 10 or Windows 11:
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-RAUL-Full-Setup.ps1
 
-Run from PowerShell:
-  powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-RAUL-2.0.ps1
+This combined script:
+  - Prompts for supporting software:
+      Chrome
+      Chrome Remote Desktop Host
+      Twido Suite
+      Schneider Machine Expert Basic
+      Python
+  - Sets the PC up for remote/always-on use:
+      keeps system awake
+      opens Chrome Remote Desktop setup
+      adds Chrome Remote Desktop firewall rules
+      optionally renames the computer
+      optionally sets display scaling to 125%
+      enables ClearType
+      disables OneDrive
+      reduces Edge prompts/shortcuts
+      optionally configures the PLC Ethernet adapter
+  - Downloads and unzips RAUL 2.0
+  - Updates RAULDASH and RAULMANUAL settings
+  - Updates RAULMANUAL raul_config tab_name
+  - Installs RAULDASH Python requirements and Flask
+  - Creates a Windows startup BAT file that starts both RAUL apps
 #>
+
+param([switch]$Resume)
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# -------------------- Settings you may change --------------------
-$DriveZipUrl = "https://drive.google.com/file/d/1EYRUZByBWuTKHPfY0sN6Lw_IQgSYTmu_/view?usp=sharing"
+# ==================== LINKS ====================
+$GDRIVE_RAUL_ZIP    = "https://drive.google.com/file/d/1EYRUZByBWuTKHPfY0sN6Lw_IQgSYTmu_/view?usp=sharing"
+$GDRIVE_PY_EXE      = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
+$GDRIVE_MEB_EXE     = "https://drive.google.com/file/d/1_-YOGugROM57rIpOz0ODy8EBL8AuR0X-/view?usp=sharing"
+$GDRIVE_CRD_MSI     = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
+$GDRIVE_TWIDO_ZIP   = "https://drive.google.com/file/d/1PnXn2OLx4FmYFxn7qAgNHrVZoi5FlVeC/view?usp=sharing"
+$GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGnyV-X4qPQqeDr0-D8?usp=drive_link"
+
+$FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
+$FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+$FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
+
+# ==================== PATHS ====================
+$StableDir = "C:\ProgramData\Trivial"
+$WorkDir = Join-Path $StableDir "RAULInstaller"
+$Log = Join-Path $StableDir "raul-full-setup.log"
 $InstallRoot = Join-Path $env:USERPROFILE "Downloads\RAUL 2.0"
-$DefaultManualServerUrl = "http://127.0.0.1:5000"
-$PythonInstallerUrl = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 $StartupBatName = "Start_RAUL_Apps.bat"
-# ------------------------------------------------------------------
 
-$WorkDir = Join-Path $env:ProgramData "Trivial\RAULInstaller"
-$ZipPath = Join-Path $WorkDir "RAUL 2.0.zip"
-$ExtractTemp = Join-Path $WorkDir "extract"
-$LogPath = Join-Path $WorkDir "install-raul.log"
-
+New-Item -ItemType Directory -Path $StableDir -Force | Out-Null
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
-function Write-Log {
+"=== Run: $(Get-Date) on $env:COMPUTERNAME ===" | Out-File $Log -Append -Encoding utf8 -Force
+
+function WriteLog {
     param([string]$Message)
 
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Write-Host $line
-    $line | Out-File -FilePath $LogPath -Append -Encoding utf8
+    $line | Out-File -FilePath $Log -Append -Encoding utf8 -Force
 }
 
-function Get-GoogleDriveFileId {
-    param([string]$Url)
+function Report {
+    param([string]$Message)
 
-    if ($Url -match "/d/([A-Za-z0-9_-]+)") {
-        return $Matches[1]
-    }
-
-    if ($Url -match "id=([A-Za-z0-9_-]+)") {
-        return $Matches[1]
-    }
-
-    throw "Could not find a Google Drive file ID in this URL: $Url"
+    $Global:ChangeReport += $Message
+    WriteLog $Message
 }
 
-function Test-ZipFile {
+$Global:ChangeReport = @()
+
+function Assert-Admin {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Run this script as Administrator."
+    }
+}
+
+function Prompt-YesNo {
+    param(
+        [Parameter(Mandatory=$true)][string]$Question,
+        [bool]$DefaultYes = $true
+    )
+
+    $defaultText = if ($DefaultYes) { "Y" } else { "N" }
+
+    while ($true) {
+        $answer = (Read-Host "$Question (Y/N, default $defaultText)").Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $DefaultYes }
+        if ($answer -match "^[Yy]") { return $true }
+        if ($answer -match "^[Nn]") { return $false }
+    }
+}
+
+function Try-Run {
+    param(
+        [scriptblock]$ScriptBlock,
+        [string]$Description
+    )
+
+    try {
+        & $ScriptBlock
+        Report "OK: $Description"
+    }
+    catch {
+        WriteLog "ERR: $Description :: $($_.Exception.Message)"
+        Write-Warning "Failed: $Description -> $($_.Exception.Message)"
+        $Global:ChangeReport += "FAILED: $Description ($($_.Exception.Message))"
+    }
+}
+
+function Wait-Network {
+    param([int]$TimeoutSec = 120)
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            [void][System.Net.Dns]::GetHostEntry("www.google.com")
+            WriteLog "Network ready"
+            return $true
+        }
+        catch {
+            Start-Sleep 3
+        }
+    }
+
+    WriteLog "Network not ready after $TimeoutSec seconds"
+    return $false
+}
+
+function Test-NotHtml {
     param([string]$Path)
 
-    if (-not (Test-Path $Path)) {
+    if (-not (Test-Path $Path)) { return $false }
+
+    try {
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 32) { return $false }
+        $sliceLen = [Math]::Min(2048, $bytes.Length)
+        $text = [Text.Encoding]::ASCII.GetString($bytes, 0, $sliceLen)
+        if ($text -match "<!DOCTYPE\s+html" -or $text -match "<html" -or $text -match "Google Drive" -or $text -match "quota exceeded" -or $text -match "Sign in") {
+            return $false
+        }
+        return $true
+    }
+    catch {
         return $false
     }
+}
+
+function Test-InstallerMagic {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) { return $false }
+
+    try {
+        $stream = [IO.File]::Open($Path, "Open", "Read", "Read")
+        $reader = New-Object IO.BinaryReader($stream)
+        $bytes = $reader.ReadBytes(8)
+        $reader.Close()
+        $stream.Close()
+
+        if ($bytes.Length -lt 2) { return $false }
+        if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) { return $true }
+        if ($bytes.Length -ge 8 -and $bytes[0] -eq 0xD0 -and $bytes[1] -eq 0xCF -and $bytes[2] -eq 0x11 -and $bytes[3] -eq 0xE0) { return $true }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-ZipMagic {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) { return $false }
 
     try {
         $stream = [IO.File]::Open($Path, "Open", "Read", "Read")
@@ -70,7 +186,6 @@ function Test-ZipFile {
         $bytes = $reader.ReadBytes(4)
         $reader.Close()
         $stream.Close()
-
         return ($bytes.Length -ge 2 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B)
     }
     catch {
@@ -78,25 +193,34 @@ function Test-ZipFile {
     }
 }
 
+function Get-GoogleDriveFileId {
+    param([string]$Url)
+
+    if ($Url -match "/d/([A-Za-z0-9_-]+)") { return $Matches[1] }
+    if ($Url -match "id=([A-Za-z0-9_-]+)") { return $Matches[1] }
+    throw "Bad Google Drive URL: $Url"
+}
+
 function Download-GoogleDriveFile {
     param(
         [string]$ShareUrl,
-        [string]$DestinationPath
+        [string]$DestinationPath,
+        [int64]$MinBytes = 1MB,
+        [ValidateSet("Installer","Zip","Any")][string]$Kind = "Any"
     )
 
     $fileId = Get-GoogleDriveFileId -Url $ShareUrl
     $baseUrl = "https://docs.google.com/uc?export=download&id=$fileId"
-
-    if (Test-Path $DestinationPath) {
-        Remove-Item $DestinationPath -Force
-    }
-
     $headers = @{
         "User-Agent" = "Mozilla/5.0"
         "Accept" = "*/*"
     }
 
-    Write-Log "Downloading RAUL zip from Google Drive..."
+    if (Test-Path $DestinationPath) {
+        Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
+    }
+
+    WriteLog "Downloading from Google Drive: $fileId"
 
     $session = $null
     $response = Invoke-WebRequest -UseBasicParsing -Uri $baseUrl -Headers $headers -SessionVariable session -TimeoutSec 3600
@@ -113,7 +237,9 @@ function Download-GoogleDriveFile {
         if ($response.Content -match "confirm=([0-9A-Za-z_-]+)") {
             $confirmToken = $Matches[1]
         }
-        elseif ($response.Content -match 'name="confirm"\s+value="([0-9A-Za-z_-]+)"') {
+        elseif ($response.Content -match 'name="confirm"\s+value="([0-9A-Za-z_-]+)"') {            $confirmToken = $Matches[1]
+        }
+        elseif ($response.Content -match 'href="[^"]*?confirm=([0-9A-Za-z_-]+)[^"]*"') {
             $confirmToken = $Matches[1]
         }
     }
@@ -126,61 +252,488 @@ function Download-GoogleDriveFile {
         Invoke-WebRequest -UseBasicParsing -Uri $baseUrl -WebSession $session -Headers $headers -OutFile $DestinationPath -TimeoutSec 3600
     }
 
-    if (-not (Test-ZipFile -Path $DestinationPath)) {
-        throw "Download finished, but the file is not a valid ZIP. Make sure the Google Drive file is shared so anyone with the link can download it."
+    if (-not (Test-Path $DestinationPath)) { throw "Download failed. File was not created." }
+    if ((Get-Item $DestinationPath).Length -lt $MinBytes) { throw "Download is too small: $DestinationPath" }
+    if (-not (Test-NotHtml $DestinationPath)) { throw "Downloaded an HTML page instead of a file. Check Drive permissions." }
+
+    if ($Kind -eq "Installer" -and -not (Test-InstallerMagic $DestinationPath)) { throw "Downloaded file is not a valid EXE/MSI." }
+    if ($Kind -eq "Zip" -and -not (Test-ZipMagic $DestinationPath)) { throw "Downloaded file is not a valid ZIP." }
+
+    WriteLog "Downloaded to $DestinationPath"
+    return $DestinationPath
+}
+
+function Invoke-WebRequest-Retry {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [int]$Retries = 4,
+        [int]$DelaySec = 8
+    )
+
+    for ($i = 1; $i -le $Retries; $i++) {
+        try {
+            if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 3600
+            if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 1MB)) { return $OutFile }
+            throw "Downloaded file missing or too small"
+        }
+        catch {
+            WriteLog "Attempt $i/$Retries failed: $($_.Exception.Message)"
+            if ($i -eq $Retries) { throw }
+            Start-Sleep $DelaySec
+        }
+    }
+}
+
+function Get-FromSources {
+    param(
+        [string]$LocalName,
+        [string[]]$Sources,
+        [int64]$MinBytes = 1MB,
+        [ValidateSet("Installer","Zip")][string]$Kind = "Installer"
+    )
+
+    $local = Join-Path $WorkDir $LocalName
+
+    if (Test-Path $local -and (Get-Item $local).Length -ge $MinBytes -and (Test-NotHtml $local)) {
+        if (($Kind -eq "Installer" -and (Test-InstallerMagic $local)) -or ($Kind -eq "Zip" -and (Test-ZipMagic $local))) {
+            WriteLog "Using local cached file: $local"
+            return $local
+        }
     }
 
-    Write-Log "Downloaded ZIP to $DestinationPath"
+    $dest = Join-Path $env:TEMP $LocalName
+
+    foreach ($source in $Sources) {
+        if (-not $source) { continue }
+        try {
+            if ($source -like "*drive.google.com*") {
+                return Download-GoogleDriveFile -ShareUrl $source -DestinationPath $dest -MinBytes $MinBytes -Kind $Kind
+            }
+
+            WriteLog "Downloading: $source"
+            Invoke-WebRequest-Retry -Uri $source -OutFile $dest | Out-Null
+
+            if ((Get-Item $dest).Length -lt $MinBytes) { throw "Downloaded file too small" }
+            if (-not (Test-NotHtml $dest)) { throw "Downloaded HTML instead of file" }
+            if ($Kind -eq "Installer" -and -not (Test-InstallerMagic $dest)) { throw "Bad installer signature" }
+            if ($Kind -eq "Zip" -and -not (Test-ZipMagic $dest)) { throw "Bad ZIP signature" }
+
+            return $dest
+        }
+        catch {
+            WriteLog "Source failed: $source :: $($_.Exception.Message)"
+        }
+    }
+
+    throw "All sources failed for $LocalName"
+}
+
+function Open-ManualAndWait {
+    param(
+        [string]$UrlPrimary,
+        [string]$Message,
+        [string]$TargetPath = "",
+        [string]$UrlAlsoOpen = "",
+        [int]$PollSeconds = 10,
+        [int]$MaxMinutes = 90
+    )
+
+    Write-Warning $Message
+
+    try {
+        if ($UrlAlsoOpen) {
+            Start-Process "chrome.exe" "--new-window $UrlPrimary"
+            Start-Process "chrome.exe" $UrlAlsoOpen | Out-Null
+        }
+        else {
+            Start-Process $UrlPrimary | Out-Null
+        }
+    }
+    catch {
+        Start-Process $UrlPrimary | Out-Null
+    }
+
+    if (-not $TargetPath) {
+        Read-Host "When done, press ENTER"
+        return $true
+    }
+
+    $deadline = (Get-Date).AddMinutes($MaxMinutes)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $TargetPath) {
+            WriteLog "Detected manual download: $TargetPath"
+            return $true
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    return $false
+}
+
+function Test-ChromeInstalled {
+    $paths = @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+    )
+
+    if ($paths | Where-Object { Test-Path $_ }) { return $true }
+
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+
+    foreach ($key in $keys) {
+        $hit = Get-ChildItem $key -ErrorAction SilentlyContinue |
+            ForEach-Object { try { Get-ItemProperty $_.PSPath } catch {} } |
+            Where-Object { $_.DisplayName -like "Google Chrome*" }
+        if ($hit) { return $true }
+    }
+
+    return $false
+}
+
+function Install-Chrome {
+    if (Test-ChromeInstalled) {
+        Report "Chrome already installed."
+        return
+    }
+
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
+    }
+    else {
+        $chromeMsi = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_MSI) -Kind Installer
+        Start-Process msiexec.exe -ArgumentList "/i `"$chromeMsi`" /qn /norestart" -Wait
+    }
+
+    Report "Chrome installed."
+}
+
+function Install-ChromeRemoteDesktop {
+    $crdLocal = $null
+
+    try {
+        $crdLocal = Get-FromSources -LocalName "chromeremotedesktophost.msi" -Sources @($GDRIVE_CRD_MSI, $FALLBACK_CRD_MSI) -Kind Installer
+    }
+    catch {
+        WriteLog "CRD auto-download failed: $($_.Exception.Message)"
+    }
+
+    if (-not $crdLocal) {
+        $target = Join-Path $env:USERPROFILE "Downloads\chromeremotedesktophost.msi"
+        $msg = "Download Chrome Remote Desktop Host and save it as: $target. The script will continue when the file appears."
+        [void](Open-ManualAndWait -UrlPrimary $FALLBACK_CRD_MSI -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
+        if (Test-Path $target) { $crdLocal = $target }
+    }
+
+    if ($crdLocal) {
+        Start-Process msiexec.exe -ArgumentList "/i `"$crdLocal`" /qn /norestart" -Wait -NoNewWindow
+    }
+
+    $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
+    $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "Chrome Remote Desktop*" }
+
+    if ((Test-Path $hostExe) -or $svc) {
+        Report "Chrome Remote Desktop Host installed."
+    }
+    else {
+        Start-Process "https://remotedesktop.google.com/access" | Out-Null
+        $Global:ChangeReport += "ACTION NEEDED: Finish Chrome Remote Desktop setup in browser."
+    }
+}
+
+function Configure-ChromeRemoteDesktopFirewall {
+    $hostExe = "$env:ProgramFiles\Google\Chrome Remote Desktop\CurrentVersion\remoting_host.exe"
+
+    if (Test-Path $hostExe) {
+        New-NetFirewallRule -DisplayName "Chrome Remote Desktop Inbound" -Direction Inbound -Program $hostExe -Action Allow -Protocol TCP -Profile Any -ErrorAction SilentlyContinue | Out-Null
+        New-NetFirewallRule -DisplayName "Chrome Remote Desktop Outbound" -Direction Outbound -Program $hostExe -Action Allow -Protocol TCP -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    Start-Process "https://remotedesktop.google.com/access" | Out-Null
+    Report "Chrome Remote Desktop firewall rules checked and access page opened."
 }
 
 function Get-PythonCommand {
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($python) {
-        return "python"
-    }
-
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) {
-        return "py -3"
-    }
-
+    if (Get-Command python -ErrorAction SilentlyContinue) { return "python" }
+    if (Get-Command py -ErrorAction SilentlyContinue) { return "py -3" }
     return $null
 }
 
-function Ensure-Python {
-    $pythonCommand = Get-PythonCommand
+function Refresh-Path {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
 
-    if ($pythonCommand) {
-        Write-Log "Python found: $pythonCommand"
-        return $pythonCommand
+function Ensure-Python {
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        Report "Python already available in PATH as: python"
+        return "python"
     }
 
-    $installer = Join-Path $WorkDir "python-installer.exe"
+    $pythonInstaller = $null    try {
+        $pythonInstaller = Get-FromSources -LocalName "python_installer.exe" -Sources @($GDRIVE_PY_EXE, $FALLBACK_PY_EXE) -Kind Installer
+    }
+    catch {
+        WriteLog "Python auto-download failed: $($_.Exception.Message)"
+    }
 
-    Write-Log "Python not found. Downloading Python installer..."
-    Invoke-WebRequest -UseBasicParsing -Uri $PythonInstallerUrl -OutFile $installer -TimeoutSec 3600
+    if (-not $pythonInstaller) {
+        [void](Open-ManualAndWait -UrlPrimary "https://www.python.org/downloads/windows/" -Message "Download and install Python 3.x 64-bit. IMPORTANT: check Add Python to PATH. Press ENTER here when finished.")
+    }
+    else {
+        Start-Process -FilePath $pythonInstaller -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_pip=1" -Wait -NoNewWindow
+    }
 
-    Write-Log "Installing Python for the current user..."
-    Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_pip=1" -Wait
-
-    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-    $pythonCommand = Get-PythonCommand
+    Refresh-Path
+    $pythonCommand = if (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { $null }
 
     if (-not $pythonCommand) {
-        throw "Python installed, but it was not found in PATH. Restart the computer, then run this script again."
+        throw "Python was not detected in PATH. Restart Windows, then run this script again."
     }
 
-    Write-Log "Python installed successfully: $pythonCommand"
+    Report "Python installed and available in PATH as: $pythonCommand"
     return $pythonCommand
+}
+
+function Invoke-Python {
+    param(
+        [string]$PythonCommand,
+        [string[]]$Arguments
+    )
+
+    if ($PythonCommand -eq "py -3") {
+        & py -3 @Arguments
+    }
+    else {
+        & python @Arguments
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python command failed: $PythonCommand $($Arguments -join ' ')"
+    }
+}
+
+function Install-TwidoSuite {
+    $zip = $null
+
+    try {
+        $zip = Get-FromSources -LocalName "TwidoSuite.2.33.MultiLanguages.zip" -Sources @($GDRIVE_TWIDO_ZIP) -MinBytes 5MB -Kind Zip
+    }
+    catch {
+        WriteLog "Twido auto-download failed: $($_.Exception.Message)"
+    }
+
+    if (-not $zip) {
+        foreach ($candidate in @(
+            (Join-Path $env:USERPROFILE "Downloads\TwidoSuite.2.33.MultiLanguages.zip"),
+            (Join-Path $env:USERPROFILE "Desktop\TwidoSuite.2.33.MultiLanguages.zip")
+        )) {
+            if ((Test-Path $candidate) -and (Test-ZipMagic $candidate)) {
+                $zip = $candidate
+                break
+            }
+        }
+    }
+
+    if (-not $zip) {
+        $target = Join-Path $env:USERPROFILE "Downloads\TwidoSuite.2.33.MultiLanguages.zip"
+        $msg = "Drive will open. Download Twido and save it as: $target. The script continues when the file appears."
+        [void](Open-ManualAndWait -UrlPrimary $GDRIVE_TWIDO_ZIP -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
+        if ((Test-Path $target) -and (Test-ZipMagic $target)) { $zip = $target }
+    }
+
+    if (-not $zip) { throw "Twido ZIP not available." }
+
+    $extractRoot = Join-Path $env:TEMP "TwidoSuite_extract"
+    if (Test-Path $extractRoot) { Remove-Item $extractRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+
+    Expand-Archive -Path $zip -DestinationPath $extractRoot -Force
+    $setup = Get-ChildItem -Path $extractRoot -Filter "TwidoSuiteInstaller.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not $setup) { throw "TwidoSuiteInstaller.exe not found after extracting ZIP." }
+
+    Start-Process -FilePath $setup.FullName -Wait
+    Report "Twido Suite installer launched."
+}
+
+function Install-MachineExpertBasic {
+    $installer = $null
+
+    try {
+        $installer = Get-FromSources -LocalName "MachineExpertBasic_Setup.exe" -Sources @($GDRIVE_MEB_EXE) -MinBytes 450MB -Kind Installer
+    }
+    catch {
+        WriteLog "Machine Expert auto-download failed: $($_.Exception.Message)"
+    }
+
+    if (-not $installer) {
+        foreach ($candidate in @(
+            (Join-Path $env:USERPROFILE "Downloads\MachineExpertBasic_Setup.exe"),
+            (Join-Path $env:USERPROFILE "Desktop\MachineExpertBasic_Setup.exe")
+        )) {
+            if ((Test-Path $candidate) -and (Test-InstallerMagic $candidate)) {
+                $installer = $candidate
+                break
+            }
+        }
+    }
+
+    if (-not $installer) {
+        $target = Join-Path $env:USERPROFILE "Downloads\MachineExpertBasic_Setup.exe"
+        $msg = "Drive will open. Download Machine Expert Basic and save it as: $target. The script continues when the file appears."
+        [void](Open-ManualAndWait -UrlPrimary $GDRIVE_MEB_EXE -UrlAlsoOpen $GDRIVE_FOLDER_ROOT -Message $msg -TargetPath $target)
+        if ((Test-Path $target) -and (Test-InstallerMagic $target)) { $installer = $target }
+    }
+
+    if (-not $installer) { throw "Machine Expert Basic installer not available." }
+
+    $silentWorked = $false
+    foreach ($switch in @("/S", "/silent", "/verysilent", "/qn", "/quiet", "/s", "/passive")) {
+        try {
+            Start-Process -FilePath $installer -ArgumentList $switch -Wait -NoNewWindow -ErrorAction Stop
+            $silentWorked = $true
+            break
+        }
+        catch {}
+    }
+
+    if (-not $silentWorked) {
+        Start-Process -FilePath $installer -Wait
+    }
+
+    Report "Machine Expert Basic installed or launched for manual install."
+}
+
+function Ensure-ClearType {
+    New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
+    Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "FontSmoothing" -Type String -Value "2"
+    Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "FontSmoothingType" -Type DWord -Value 2
+    Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "FontSmoothingGamma" -Type DWord -Value 1900 -ErrorAction SilentlyContinue
+    Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "FontSmoothingOrientation" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+    rundll32.exe user32.dll,UpdatePerUserSystemParameters
+    Report "ClearType enabled."
+}
+
+function Configure-PowerSettings {
+    powercfg /HIBERNATE OFF
+    powercfg -Change -standby-timeout-ac 0
+    powercfg -Change -monitor-timeout-ac 0
+    powercfg -Change -disk-timeout-ac 0
+    powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_VIDEO ADAPTBRIGHT 0
+    powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP HYBRIDSLEEP 0
+    powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
+    powercfg -SetActive SCHEME_CURRENT
+    Report "Power settings set to always-on."
+}
+
+function Configure-WindowsUpdatePolicy {
+    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Force | Out-Null
+    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Force | Out-Null
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Type DWord -Value 1
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "AUOptions" -Type DWord -Value 2
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name "ExcludeWUDriversInQualityUpdate" -Type DWord -Value 1
+
+    foreach ($serviceName in @("wuauserv", "UsoSvc", "BITS", "DoSvc", "WaaSMedicSvc")) {
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($service) {
+            try { Stop-Service $serviceName -Force -ErrorAction SilentlyContinue } catch {}
+            try { Set-Service $serviceName -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    Report "Windows Update policies/services adjusted."
+}
+
+function Disable-OneDrive {
+    Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    $sys = "$env:SystemRoot\System32\OneDriveSetup.exe"
+    $wow = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+    if (Test-Path $sys) { & $sys /uninstall | Out-Null }
+    if (Test-Path $wow) { & $wow /uninstall | Out-Null }
+
+    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Force | Out-Null
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSync" -Type DWord -Value 1
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSyncNGSC" -Type DWord -Value 1
+
+    Get-ScheduledTask -TaskName "*OneDrive*" -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+    Report "OneDrive removed/disabled."
+}
+
+function Reduce-EdgePrompts {
+    New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Force | Out-Null
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "HideFirstRunExperience" -Type DWord -Value 1
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "DefaultBrowserSettingEnabled" -Type DWord -Value 0
+    Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "CreateDesktopShortcutDefault" -Type DWord -Value 0
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" /v "DisableEdgeDesktopShortcutCreation" /t REG_DWORD /d 1 /f | Out-Null
+    Report "Edge first-run prompts and desktop shortcut creation reduced."
+}
+
+function Get-DefaultRouteIfIndex {
+    (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Sort-Object -Property RouteMetric, Publish -Descending:$false |
+        Select-Object -First 1).ifIndex
+}
+
+function Get-PLCSuffix {
+    $match = [regex]::Match($env:COMPUTERNAME, "([A-Za-z])(?!.*[A-Za-z])")
+    if ($match.Success) { return $match.Groups[1].Value.ToUpper() }
+    return "A"
+}
+
+function Set-PLCAdapter {
+    param(
+        [string]$IPAddress = "192.168.1.100",
+        [int]$Prefix = 24
+    )
+
+    $defaultIf = Get-DefaultRouteIfIndex
+    $candidates = Get-NetAdapter -Physical |
+        Where-Object {
+            $_.Status -eq "Up" -and
+            $_.HardwareInterface -and
+            $_.MediaType -in 802.3, "Ethernet" -and
+            $_.ifIndex -ne $defaultIf -and
+            $_.Name -notmatch "vEthernet|Bluetooth|Wi-?Fi"
+        }
+
+    if (-not $candidates) {
+        throw "No PLC NIC candidate found. Connect the second Ethernet adapter and try again."
+    }
+
+    $nic = $candidates | Where-Object { $_.InterfaceDescription -match "Realtek.*USB" } | Select-Object -First 1
+    if (-not $nic) { $nic = $candidates | Select-Object -First 1 }
+
+    $newAlias = "PLC$(Get-PLCSuffix)"
+    if ($nic.Name -ne $newAlias) {
+        Rename-NetAdapter -Name $nic.Name -NewName $newAlias -PassThru | Out-Null
+    }    Set-NetIPInterface -InterfaceAlias $newAlias -Dhcp Disabled -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -ne $IPAddress } |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+
+    if (-not (Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $IPAddress })) {
+        New-NetIPAddress -InterfaceAlias $newAlias -IPAddress $IPAddress -PrefixLength $Prefix -ErrorAction Stop | Out-Null
+    }
+
+    Set-NetConnectionProfile -InterfaceAlias $newAlias -NetworkCategory Private -ErrorAction SilentlyContinue
+    Disable-NetAdapterBinding -Name $newAlias -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    Set-DnsClientServerAddress -InterfaceAlias $newAlias -ResetServerAddresses
+
+    Report "PLC NIC '$newAlias' set to $IPAddress/$Prefix with no gateway."
 }
 
 function Get-FirstExistingPath {
     param([string[]]$Paths)
 
     foreach ($path in $Paths) {
-        if (Test-Path $path) {
-            return $path
-        }
+        if (Test-Path $path) { return $path }
     }
 
     return $null
@@ -205,7 +758,7 @@ function Save-XmlDocument {
     }
 }
 
-function Update-SettingsFile {
+function Update-RaulSettingsFile {
     param(
         [string]$Folder,
         [string]$TabName,
@@ -231,10 +784,10 @@ function Update-SettingsFile {
     $xml.Settings.ProjectName = $ProjectName
 
     Save-XmlDocument -Xml $xml -Path $settingsPath
-    Write-Log "Updated $settingsPath"
+    Report "Updated RAUL settings: $settingsPath"
 }
 
-function Update-RaulConfig {
+function Update-RaulManualConfig {
     param(
         [string]$ManualFolder,
         [string]$TabName
@@ -246,7 +799,7 @@ function Update-RaulConfig {
     )
 
     if (-not $configPath) {
-        Write-Log "WARNING: Could not find raul_config.xml or raul_config in $ManualFolder"
+        $Global:ChangeReport += "WARNING: Could not find raul_config.xml or raul_config in $ManualFolder"
         return
     }
 
@@ -257,30 +810,12 @@ function Update-RaulConfig {
     }
 
     $xml.raul_config.history.tab_name = $TabName
-
     Save-XmlDocument -Xml $xml -Path $configPath
-    Write-Log "Updated $configPath"
+
+    Report "Updated RAUL manual config: $configPath"
 }
 
-function Invoke-Python {
-    param(
-        [string]$PythonCommand,
-        [string[]]$Arguments
-    )
-
-    if ($PythonCommand -eq "py -3") {
-        & py -3 @Arguments
-    }
-    else {
-        & python @Arguments
-    }
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python command failed: $PythonCommand $($Arguments -join ' ')"
-    }
-}
-
-function Install-PythonPackages {
+function Install-RaulPythonPackages {
     param(
         [string]$PythonCommand,
         [string]$DashFolder
@@ -288,11 +823,9 @@ function Install-PythonPackages {
 
     $requirementsPath = Join-Path $DashFolder "requirements.txt"
 
-    Write-Log "Upgrading pip..."
     Invoke-Python -PythonCommand $PythonCommand -Arguments @("-m", "pip", "install", "--upgrade", "pip")
 
     if (Test-Path $requirementsPath) {
-        Write-Log "Installing RAULDASH requirements from $requirementsPath"
         Push-Location $DashFolder
         try {
             Invoke-Python -PythonCommand $PythonCommand -Arguments @("-m", "pip", "install", "-r", "requirements.txt")
@@ -300,16 +833,63 @@ function Install-PythonPackages {
         finally {
             Pop-Location
         }
+        Report "Installed RAULDASH requirements.txt."
     }
     else {
-        Write-Log "WARNING: requirements.txt was not found in $DashFolder"
+        $Global:ChangeReport += "WARNING: requirements.txt was not found in $DashFolder"
     }
 
-    Write-Log "Installing Flask..."
     Invoke-Python -PythonCommand $PythonCommand -Arguments @("-m", "pip", "install", "flask")
+    Report "Installed Flask."
 }
 
-function Create-StartupFile {
+function Install-RaulApp {
+    param(
+        [string]$PythonCommand,
+        [string]$TabName,
+        [string]$ProjectName,
+        [string]$ManualServerUrl
+    )
+
+    $zipPath = Join-Path $WorkDir "RAUL 2.0.zip"
+    $extractTemp = Join-Path $WorkDir "raul_extract"
+
+    Download-GoogleDriveFile -ShareUrl $GDRIVE_RAUL_ZIP -DestinationPath $zipPath -MinBytes 1MB -Kind Zip | Out-Null
+
+    if (Test-Path $extractTemp) { Remove-Item $extractTemp -Recurse -Force }
+    New-Item -ItemType Directory -Path $extractTemp -Force | Out-Null
+
+    Expand-Archive -Path $zipPath -DestinationPath $extractTemp -Force
+
+    $dashSource = Get-ChildItem -Path $extractTemp -Directory -Recurse | Where-Object { $_.Name -ieq "RAULDASH" } | Select-Object -First 1
+    $manualSource = Get-ChildItem -Path $extractTemp -Directory -Recurse | Where-Object { $_.Name -ieq "RAULMANUAL" } | Select-Object -First 1
+
+    if (-not $dashSource) { throw "RAULDASH folder was not found inside RAUL ZIP." }
+    if (-not $manualSource) { throw "RAULMANUAL folder was not found inside RAUL ZIP." }
+
+    if (Test-Path $InstallRoot) {
+        $backupPath = "$InstallRoot.backup.$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        Move-Item -Path $InstallRoot -Destination $backupPath
+        Report "Existing RAUL install backed up to $backupPath"
+    }
+
+    New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    Copy-Item -Path $dashSource.FullName -Destination $InstallRoot -Recurse -Force
+    Copy-Item -Path $manualSource.FullName -Destination $InstallRoot -Recurse -Force
+
+    $dashFolder = Join-Path $InstallRoot "RAULDASH"
+    $manualFolder = Join-Path $InstallRoot "RAULMANUAL"
+
+    Update-RaulSettingsFile -Folder $dashFolder -TabName $TabName -ProjectName $ProjectName
+    Update-RaulSettingsFile -Folder $manualFolder -TabName $TabName -ProjectName $ProjectName
+    Update-RaulManualConfig -ManualFolder $manualFolder -TabName $TabName
+    Install-RaulPythonPackages -PythonCommand $PythonCommand -DashFolder $dashFolder
+    Create-RaulStartupFile -PythonCommand "python" -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
+
+    Report "RAUL 2.0 installed to $InstallRoot"
+}
+
+function Create-RaulStartupFile {
     param(
         [string]$PythonCommand,
         [string]$DashFolder,
@@ -343,95 +923,164 @@ start "" "$ManualServerUrl"
 "@
 
     $bat | Out-File -FilePath $batPath -Encoding ASCII -Force
-    Write-Log "Created startup file: $batPath"
-
-    return $batPath
+    Report "Created RAUL startup file: $batPath"
 }
 
-# -------------------- Main install --------------------
-Write-Log "==== RAUL 2.0 install started ===="
+# ==================== MAIN ====================
+Assert-Admin
 
 Write-Host ""
-Write-Host "This will install RAUL 2.0 to:"
-Write-Host "  $InstallRoot"
+Write-Host "RAUL full setup for Windows 10/11" -ForegroundColor Cyan
+Write-Host "Log file: $Log"
 Write-Host ""
 
-$tabName = Read-Host "Enter LocationLog tab name"
-$projectName = Read-Host "Enter ProjectName"
-$manualServerUrlInput = Read-Host "Enter first RAULMANUAL server URL, or press ENTER for $DefaultManualServerUrl"
+$installChrome = Prompt-YesNo "Install Google Chrome?" $true
+$installCRD = Prompt-YesNo "Install Chrome Remote Desktop Host?" $true
+$installTwido = Prompt-YesNo "Install Twido Suite?" $false
+$installMachineExpert = Prompt-YesNo "Install Schneider Machine Expert Basic?" $false
+$installPython = Prompt-YesNo "Install/check Python and PATH?" $true
+$configurePLC = Prompt-YesNo "Configure PLC Ethernet adapter to 192.168.1.100?" $true
+$disableUpdates = Prompt-YesNo "Disable automatic Windows Update services/policies?" $true
+$disableOneDrive = Prompt-YesNo "Remove/disable OneDrive?" $true
 
-$tabName = $tabName.Trim()
-$projectName = $projectName.Trim()
+Write-Host ""
+$desiredComputerName = Read-Host "Enter computer name, or press ENTER to keep $env:COMPUTERNAME"
+$wantDpi = Read-Host "Set display scaling to 125%? (Y/N, default N)"
 
-if ([string]::IsNullOrWhiteSpace($tabName)) {
-    throw "LocationLog tab name cannot be blank."
+Write-Host ""
+$tabName = (Read-Host "Enter RAUL LocationLog tab name").Trim()
+$projectName = (Read-Host "Enter RAUL ProjectName").Trim()
+$manualServerUrlInput = (Read-Host "Enter first RAULMANUAL server URL, or press ENTER for http://127.0.0.1:5000").Trim()
+
+if ([string]::IsNullOrWhiteSpace($tabName)) { throw "LocationLog tab name cannot be blank." }if ([string]::IsNullOrWhiteSpace($projectName)) { throw "ProjectName cannot be blank." }
+
+$manualServerUrl = if ([string]::IsNullOrWhiteSpace($manualServerUrlInput)) { "http://127.0.0.1:5000" } else { $manualServerUrlInput }
+$needReboot = $false
+
+if ($desiredComputerName -and $desiredComputerName -ne $env:COMPUTERNAME) {
+    Try-Run { Rename-Computer -NewName $desiredComputerName -Force } "Rename computer to $desiredComputerName"
+    $needReboot = $true
 }
 
-if ([string]::IsNullOrWhiteSpace($projectName)) {
-    throw "ProjectName cannot be blank."
+if ($wantDpi -match "^[Yy]") {
+    Try-Run {
+        New-Item -Path "HKCU:\Control Panel\Desktop" -Force | Out-Null
+        Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 120
+        Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "Win8DpiScaling" -Type DWord -Value 1
+    } "Set display scaling to 125%"
+    $needReboot = $true
 }
 
-if ([string]::IsNullOrWhiteSpace($manualServerUrlInput)) {
-    $manualServerUrl = $DefaultManualServerUrl
+Try-Run { Ensure-ClearType } "Enable ClearType"
+
+if (-not (Wait-Network -TimeoutSec 120)) {
+    Write-Warning "Network was not detected, but the script will continue."
+}
+
+Try-Run {
+    Add-MpPreference -ExclusionPath $StableDir -ErrorAction SilentlyContinue
+    Add-MpPreference -ExclusionProcess "powershell.exe" -ErrorAction SilentlyContinue
+} "Defender exclusions"
+
+if ($installChrome) {
+    Try-Run { Install-Chrome } "Install Chrome"
+    Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 3 } "Open Chrome default apps page"
+    Try-Run {
+        Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"
+        Write-Host ""
+        Write-Host "Sign into Chrome as service@thetrivialcompany.com if this PC uses that account."
+        Read-Host "Press ENTER after Chrome sign-in is complete, or press ENTER to skip"
+    } "Chrome account sign-in prompt"
 }
 else {
-    $manualServerUrl = $manualServerUrlInput.Trim()
+    Report "Skipped Chrome."
 }
 
-Download-GoogleDriveFile -ShareUrl $DriveZipUrl -DestinationPath $ZipPath
-
-if (Test-Path $ExtractTemp) {
-    Remove-Item $ExtractTemp -Recurse -Force
+if ($installCRD) {
+    Try-Run { Install-ChromeRemoteDesktop } "Install Chrome Remote Desktop Host"
+}
+else {
+    Report "Skipped Chrome Remote Desktop Host."
 }
 
-New-Item -ItemType Directory -Path $ExtractTemp -Force | Out-Null
+Try-Run { DISM /Online /Enable-Feature /FeatureName:NetFx3 /All /Quiet /NoRestart | Out-Null } "Enable .NET 3.5"
 
-Write-Log "Extracting ZIP..."
-Expand-Archive -Path $ZipPath -DestinationPath $ExtractTemp -Force
-
-$dashSource = Get-ChildItem -Path $ExtractTemp -Directory -Recurse | Where-Object { $_.Name -ieq "RAULDASH" } | Select-Object -First 1
-$manualSource = Get-ChildItem -Path $ExtractTemp -Directory -Recurse | Where-Object { $_.Name -ieq "RAULMANUAL" } | Select-Object -First 1
-
-if (-not $dashSource) {
-    throw "RAULDASH folder was not found inside the ZIP."
+if ($installPython) {
+    $pythonCommand = Ensure-Python
+}
+else {
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $pythonCommand = "python"
+    }
+    else {
+        throw "Python is required for RAUL, but the python command was not found and Python install/check was skipped."
+    }
 }
 
-if (-not $manualSource) {
-    throw "RAULMANUAL folder was not found inside the ZIP."
+if ($installTwido) {
+    Try-Run { Install-TwidoSuite } "Install Twido Suite"
+}
+else {
+    Report "Skipped Twido Suite."
 }
 
-if (Test-Path $InstallRoot) {
-    $backupPath = "$InstallRoot.backup.$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    Write-Log "Existing install found. Moving it to $backupPath"
-    Move-Item -Path $InstallRoot -Destination $backupPath
+if ($installMachineExpert) {
+    Try-Run { Install-MachineExpertBasic } "Install Schneider Machine Expert Basic"
+}
+else {
+    Report "Skipped Schneider Machine Expert Basic."
 }
 
-New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-Copy-Item -Path $dashSource.FullName -Destination $InstallRoot -Recurse -Force
-Copy-Item -Path $manualSource.FullName -Destination $InstallRoot -Recurse -Force
+Try-Run { Configure-PowerSettings } "Keep system awake"
 
-$dashFolder = Join-Path $InstallRoot "RAULDASH"
-$manualFolder = Join-Path $InstallRoot "RAULMANUAL"
+if ($disableUpdates) {
+    Try-Run { Configure-WindowsUpdatePolicy } "Disable automatic Windows Update services/policies"
+}
+else {
+    Report "Skipped Windows Update changes."
+}
 
-Update-SettingsFile -Folder $dashFolder -TabName $tabName -ProjectName $projectName
-Update-SettingsFile -Folder $manualFolder -TabName $tabName -ProjectName $projectName
-Update-RaulConfig -ManualFolder $manualFolder -TabName $tabName
+if ($disableOneDrive) {
+    Try-Run { Disable-OneDrive } "Remove/disable OneDrive"
+}
+else {
+    Report "Skipped OneDrive changes."
+}
 
-$pythonCommand = Ensure-Python
-Install-PythonPackages -PythonCommand $pythonCommand -DashFolder $dashFolder
+Try-Run { Reduce-EdgePrompts } "Reduce Edge prompts/shortcuts"
 
-$startupPath = Create-StartupFile -PythonCommand $pythonCommand -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $manualServerUrl
+if ($configurePLC) {
+    Try-Run { Set-PLCAdapter -IPAddress "192.168.1.100" -Prefix 24 } "Configure PLC NIC"
+}
+else {
+    Report "Skipped PLC NIC configuration."
+}
 
-Write-Log "==== RAUL 2.0 install completed ===="
+if ($installCRD) {
+    Try-Run { Configure-ChromeRemoteDesktopFirewall } "Configure Chrome Remote Desktop firewall/open access page"
+}
+
+Try-Run {
+    Install-RaulApp -PythonCommand $pythonCommand -TabName $tabName -ProjectName $projectName -ManualServerUrl $manualServerUrl
+} "Install and configure RAUL 2.0"
 
 Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "RAUL 2.0 SETUP COMPLETE" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Installed to: $InstallRoot"
-Write-Host "Startup file: $startupPath"
-Write-Host "Install log: $LogPath"
+Write-Host "=====================================" -ForegroundColor Cyan
+Write-Host "   RAUL FULL SETUP COMPLETED" -ForegroundColor Green
+Write-Host "=====================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "The apps will start automatically the next time this Windows user logs in."
+Write-Host "Summary:" -ForegroundColor Yellow
+$Global:ChangeReport | ForEach-Object { Write-Host " - $_" }
+Write-Host ""
+Write-Host "Detailed log: $Log" -ForegroundColor DarkGray
+
+if ($needReboot) {
+    Write-Host ""
+    Write-Host "A reboot is recommended because the computer name or DPI was changed." -ForegroundColor Yellow
+    if (Prompt-YesNo "Restart now?" $false) {
+        Restart-Computer -Force
+    }
+}
+
 Write-Host ""
 Read-Host "Press ENTER to close"
