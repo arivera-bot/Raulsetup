@@ -41,7 +41,7 @@ $GDRIVE_CRD_MSI     = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFE
 $GDRIVE_TWIDO_ZIP   = "https://drive.google.com/file/d/1PnXn2OLx4FmYFxn7qAgNHrVZoi5FlVeC/view?usp=sharing"
 $GDRIVE_FOLDER_ROOT = "https://drive.google.com/drive/folders/1FuLqB892C_6ktjGnyV-X4qPQqeDr0-D8?usp=drive_link"
 
-$FALLBACK_CHROME_MSI = "https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi"
+$FALLBACK_CHROME_MSI = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
 $FALLBACK_CRD_MSI    = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
 $FALLBACK_PY_EXE     = "https://www.python.org/ftp/python/3.12.6/python-3.12.6-amd64.exe"
 
@@ -372,13 +372,34 @@ function Open-ManualAndWait {
     return $false
 }
 
-function Test-ChromeInstalled {
+function Get-ChromePath {
     $paths = @(
         "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-        "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
     )
 
-    if ($paths | Where-Object { Test-Path $_ }) { return $true }
+    foreach ($path in $paths) {
+        if (Test-Path $path) { return $path }
+    }
+
+    $appPathKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    )
+
+    foreach ($key in $appPathKeys) {
+        try {
+            $chromePath = (Get-Item -Path $key -ErrorAction Stop).GetValue("")
+            if ($chromePath -and (Test-Path $chromePath)) { return $chromePath }
+        }
+        catch {}
+    }
+
+    return $null
+}
+
+function Test-ChromeInstalled {
+    if (Get-ChromePath) { return $true }
 
     $keys = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -398,18 +419,37 @@ function Test-ChromeInstalled {
 function Install-Chrome {
     if (Test-ChromeInstalled) {
         Report "Chrome already installed."
-        return
+        return $true
     }
 
+    $installed = $false
+
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
+        try {
+            WriteLog "Installing Chrome with winget."
+            winget install --id Google.Chrome --silent --accept-source-agreements --accept-package-agreements | Out-Null
+            Start-Sleep -Seconds 5
+            $installed = Test-ChromeInstalled
+        }
+        catch {
+            WriteLog "Chrome winget install failed: $($_.Exception.Message)"
+        }
     }
-    else {
+
+    if (-not $installed) {
+        WriteLog "Chrome was not found after winget or winget is unavailable. Downloading Chrome MSI."
         $chromeMsi = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_MSI) -Kind Installer
         Start-Process msiexec.exe -ArgumentList "/i `"$chromeMsi`" /qn /norestart" -Wait
+        Start-Sleep -Seconds 5
+        $installed = Test-ChromeInstalled
+    }
+
+    if (-not $installed) {
+        throw "Chrome installer completed, but Chrome was not detected."
     }
 
     Report "Chrome installed."
+    return $true
 }
 
 function Install-ChromeRemoteDesktop {
@@ -986,13 +1026,21 @@ Try-Run {
 
 if ($installChrome) {
     Try-Run { Install-Chrome } "Install Chrome"
-    Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 3 } "Open Chrome default apps page"
-    Try-Run {
-        Start-Process "chrome.exe" "--new-window https://accounts.google.com/ServiceLogin"
-        Write-Host ""
-        Write-Host "Sign into Chrome as service@thetrivialcompany.com if this PC uses that account."
-        Read-Host "Press ENTER after Chrome sign-in is complete, or press ENTER to skip"
-    } "Chrome account sign-in prompt"
+
+    $chromePath = Get-ChromePath
+    if ($chromePath) {
+        Try-Run { Start-Process "ms-settings:defaultapps?apiname=Microsoft.Chrome" -WindowStyle Minimized; Start-Sleep 3 } "Open Chrome default apps page"
+        Try-Run {
+            Start-Process $chromePath "--new-window https://accounts.google.com/ServiceLogin"
+            Write-Host ""
+            Write-Host "Sign into Chrome as service@thetrivialcompany.com if this PC uses that account."
+            Read-Host "Press ENTER after Chrome sign-in is complete, or press ENTER to skip"
+        } "Chrome account sign-in prompt"
+    }
+    else {
+        Write-Warning "Chrome is still not installed. Skipping Chrome default-app and sign-in steps."
+        $Global:ChangeReport += "FAILED: Chrome setup steps skipped because Chrome was not installed."
+    }
 }
 else {
     Report "Skipped Chrome."
