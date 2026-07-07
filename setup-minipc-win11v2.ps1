@@ -437,10 +437,43 @@ function Install-Chrome {
     }
 
     if (-not $installed) {
-        WriteLog "Chrome was not found after winget or winget is unavailable. Downloading Chrome MSI."
-        $chromeMsi = Get-FromSources -LocalName "GoogleChromeStandaloneEnterprise64.msi" -Sources @($FALLBACK_CHROME_MSI) -Kind Installer
-        Start-Process msiexec.exe -ArgumentList "/i `"$chromeMsi`" /qn /norestart" -Wait
-        Start-Sleep -Seconds 5
+        $chromeMsi = Join-Path $WorkDir "GoogleChromeStandaloneEnterprise64.msi"
+
+        if (-not ((Test-Path $chromeMsi) -and (Test-InstallerMagic $chromeMsi))) {
+            WriteLog "Chrome MSI not found. Downloading Chrome MSI to $chromeMsi"
+            try {
+                Invoke-WebRequest-Retry -Uri $FALLBACK_CHROME_MSI -OutFile $chromeMsi | Out-Null
+            }
+            catch {
+                WriteLog "Chrome MSI download failed: $($_.Exception.Message)"
+            }
+        }
+
+        if ((Test-Path $chromeMsi) -and (Test-InstallerMagic $chromeMsi)) {
+            WriteLog "Installing Chrome from $chromeMsi"
+            Start-Process msiexec.exe -ArgumentList "/i `"$chromeMsi`" /qn /norestart" -Wait
+            Start-Sleep -Seconds 5
+            $installed = Test-ChromeInstalled
+        }
+        else {
+            WriteLog "Chrome MSI is not available. Skipping MSI install."
+        }
+    }
+
+    if (-not $installed) {
+        $chromeExeInstaller = Join-Path $WorkDir "ChromeSetup.exe"
+        $chromeExeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+
+        WriteLog "Downloading Chrome online installer to $chromeExeInstaller"
+        Invoke-WebRequest-Retry -Uri $chromeExeUrl -OutFile $chromeExeInstaller | Out-Null
+
+        if (-not ((Test-Path $chromeExeInstaller) -and (Test-InstallerMagic $chromeExeInstaller))) {
+            throw "Chrome online installer was not downloaded correctly."
+        }
+
+        WriteLog "Installing Chrome from online installer."
+        Start-Process -FilePath $chromeExeInstaller -ArgumentList "/silent /install" -Wait
+        Start-Sleep -Seconds 10
         $installed = Test-ChromeInstalled
     }
 
