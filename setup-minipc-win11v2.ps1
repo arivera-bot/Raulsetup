@@ -1014,6 +1014,36 @@ function Get-ManualServerPort {
     return 5000
 }
 
+function Resolve-ManualServerUrlFromPort {
+    param([string]$PortInput)
+
+    if ([string]::IsNullOrWhiteSpace($PortInput)) {
+        return "http://127.0.0.1:5000"
+    }
+
+    $portText = $PortInput.Trim()
+
+    # Backward compatible: if a full URL is pasted, keep accepting it.
+    if ($portText -match '^https?://') {
+        $port = Get-ManualServerPort -ManualServerUrl $portText
+        if ($port -lt 1 -or $port -gt 65535) {
+            throw "Invalid RAULMANUAL port: $port"
+        }
+        return $portText
+    }
+
+    $port = 0
+    if (-not [int]::TryParse($portText, [ref]$port)) {
+        throw "RAULMANUAL port must be a number between 1 and 65535. Example: 5001"
+    }
+
+    if ($port -lt 1 -or $port -gt 65535) {
+        throw "RAULMANUAL port must be between 1 and 65535. You entered: $port"
+    }
+
+    return "http://127.0.0.1:$port"
+}
+
 function Update-RaulManualServerPort {
     param(
         [string]$ManualFolder,
@@ -1218,11 +1248,12 @@ $wantDpi = Read-Host "Set display scaling to 125%? (Y/N, default N)"
 Write-Host ""
 $tabName = (Read-Host "Enter RAUL LocationLog tab name").Trim()
 $projectName = (Read-Host "Enter RAUL ProjectName").Trim()
-$manualServerUrlInput = (Read-Host "Enter first RAULMANUAL server URL, or press ENTER for http://127.0.0.1:5000").Trim()
+$manualServerPortInput = (Read-Host "Enter RAULMANUAL port, or press ENTER for 5000").Trim()
 
 if ([string]::IsNullOrWhiteSpace($tabName)) { throw "LocationLog tab name cannot be blank." }if ([string]::IsNullOrWhiteSpace($projectName)) { throw "ProjectName cannot be blank." }
 
-$manualServerUrl = if ([string]::IsNullOrWhiteSpace($manualServerUrlInput)) { "http://127.0.0.1:5000" } else { $manualServerUrlInput }
+$manualServerUrl = Resolve-ManualServerUrlFromPort -PortInput $manualServerPortInput
+WriteLog "RAULMANUAL server URL resolved to $manualServerUrl"
 $needReboot = $false
 
 if ($desiredComputerName -and $desiredComputerName -ne $env:COMPUTERNAME) {
