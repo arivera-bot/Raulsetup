@@ -994,6 +994,77 @@ function Update-RaulManualConfig {
     Report "Updated RAUL manual config: $configPath"
 }
 
+function Get-ManualServerPort {
+    param([string]$ManualServerUrl)
+
+    if ([string]::IsNullOrWhiteSpace($ManualServerUrl)) {
+        return 5000
+    }
+
+    try {
+        $uri = [Uri]$ManualServerUrl
+        if ($uri.Port -gt 0) {
+            return [int]$uri.Port
+        }
+    }
+    catch {
+        WriteLog "Could not parse RAULMANUAL server URL '$ManualServerUrl'. Defaulting RAULMANUAL app port to 5000."
+    }
+
+    return 5000
+}
+
+function Update-RaulManualServerPort {
+    param(
+        [string]$ManualFolder,
+        [string]$ManualServerUrl
+    )
+
+    $port = Get-ManualServerPort -ManualServerUrl $ManualServerUrl
+    if ($port -lt 1 -or $port -gt 65535) {
+        throw "Invalid RAULMANUAL port: $port"
+    }
+
+    $changed = 0
+
+    $candidateFiles = Get-ChildItem -Path $ManualFolder -Recurse -File -Include "*.py","*.txt","*.xml","*.json","*.html","*.js" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.FullName -notmatch "\\Old Versions\\" -and
+            $_.FullName -notmatch "\\__pycache__\\"
+        }
+
+    foreach ($file in $candidateFiles) {
+        try {
+            $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+            $updated = $content
+
+            # Python Flask app.run(...) server port references.
+            $updated = [regex]::Replace($updated, 'port\s*=\s*5000', "port=$port")
+
+            # Literal local URLs used by RAULMANUAL itself, if present.
+            $updated = $updated -replace 'http://127\.0\.0\.1:5000', "http://127.0.0.1:$port"
+            $updated = $updated -replace 'http://localhost:5000', "http://localhost:$port"
+
+            # Do NOT replace standalone "5000" values because several HTML files use 5000ms refresh intervals.
+            if ($updated -ne $content) {
+                Set-Content -Path $file.FullName -Value $updated -Encoding UTF8
+                $changed++
+                WriteLog "Updated RAULMANUAL server port in $($file.FullName)"
+            }
+        }
+        catch {
+            WriteLog "WARNING: Could not update RAULMANUAL server port in $($file.FullName): $($_.Exception.Message)"
+        }
+    }
+
+    if ($changed -eq 0) {
+        $Global:ChangeReport += "WARNING: No RAULMANUAL server port references were updated. Expected app.run(... port=5000 ...) in RAULMANUAL."
+    }
+    else {
+        Report "Updated RAULMANUAL app server port to $port in $changed file(s)."
+    }
+}
+
 function Install-RaulPythonPackages {
     param(
         [string]$PythonCommand,
@@ -1079,6 +1150,7 @@ function Install-RaulApp {
     Update-RaulSettingsFile -Folder $dashFolder -TabName $TabName -ProjectName $ProjectName
     Update-RaulSettingsFile -Folder $manualFolder -TabName $TabName -ProjectName $ProjectName
     Update-RaulManualConfig -ManualFolder $manualFolder -TabName $TabName
+    Update-RaulManualServerPort -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
     Install-RaulPythonPackages -PythonCommand $PythonCommand -DashFolder $dashFolder
     Create-RaulStartupFile -PythonCommand $PythonCommand -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
 
@@ -1290,4 +1362,3 @@ if ($needReboot) {
 
 Write-Host ""
 Read-Host "Press ENTER to close"
-
