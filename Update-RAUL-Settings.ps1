@@ -141,22 +141,29 @@ function Update-RaulManualPort {
         throw "Could not find raul_manual.py at $manualPy"
     }
 
-    # Preserve UTF-8 as much as possible. This prevents rewriting the whole file with bad encoding.
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $content = [System.IO.File]::ReadAllText($manualPy, [System.Text.Encoding]::UTF8)
 
-    $pattern = 'app\.run\(host="0\.0\.0\.0",\s*port=\d+,\s*debug=True\)'
-    $replacement = "app.run(host=""0.0.0.0"", port=$Port, debug=True)"
+    # Match app.run(...) even if spacing/quotes/arguments are slightly different.
+    $pattern = '(?m)^\s*app\.run\((?<args>.*?)\)\s*$'
+    $match = [regex]::Match($content, $pattern)
 
-    $newContent = [regex]::Replace($content, $pattern, $replacement)
-
-    if ($newContent -eq $content) {
-        throw "Could not find this pattern in raul_manual.py: app.run(host=""0.0.0.0"", port=####, debug=True)"
+    if (-not $match.Success) {
+        throw "Could not find any app.run(...) line in raul_manual.py"
     }
+
+    $oldLine = $match.Value
+
+    # Preserve network access by forcing host 0.0.0.0, and update only the port.
+    $newLine = "    app.run(host=""0.0.0.0"", port=$Port, debug=True)"
+
+    $newContent = $content.Remove($match.Index, $match.Length).Insert($match.Index, $newLine)
 
     [System.IO.File]::WriteAllText($manualPy, $newContent, $utf8NoBom)
 
     Write-OK "Updated RAULMANUAL port to $Port in raul_manual.py"
+    Write-Info "Old app.run line: $oldLine"
+    Write-Info "New app.run line: $newLine"
 }
 
 function Update-FirewallForPort {
@@ -270,7 +277,20 @@ Write-Host ""
 $newComputerName = Read-Host "Enter new computer name, or press ENTER to keep $env:COMPUTERNAME"
 $tabName = Read-Host "Enter LocationLog tab name"
 $projectName = Read-Host "Enter ProjectName / Job name"
-$portInput = Read-Host "Enter RAULMANUAL port, or press ENTER for 5000"
+$portInput = Read-Host "Enter RAULMANUAL port, or press ENTER to leave current port unchanged"
+
+if ([string]::IsNullOrWhiteSpace($portInput)) {
+    $changePort = $false
+    $port = $null
+}
+else {
+    $changePort = $true
+    $port = [int]$portInput
+
+    if ($port -lt 1 -or $port -gt 65535) {
+        throw "Invalid port number: $port"
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($tabName)) {
     throw "LocationLog tab name cannot be blank."
@@ -278,17 +298,6 @@ if ([string]::IsNullOrWhiteSpace($tabName)) {
 
 if ([string]::IsNullOrWhiteSpace($projectName)) {
     throw "ProjectName / Job name cannot be blank."
-}
-
-if ([string]::IsNullOrWhiteSpace($portInput)) {
-    $port = 5000
-}
-else {
-    $port = [int]$portInput
-}
-
-if ($port -lt 1 -or $port -gt 65535) {
-    throw "Invalid port number: $port"
 }
 
 Write-Host ""
@@ -299,9 +308,14 @@ $needsReboot = Rename-ThisComputer -NewComputerName $newComputerName
 Update-SettingsXml -Folder $DashFolder -TabName $tabName.Trim() -ProjectName $projectName.Trim()
 Update-SettingsXml -Folder $ManualFolder -TabName $tabName.Trim() -ProjectName $projectName.Trim()
 Update-RaulConfig -ManualFolder $ManualFolder -TabName $tabName.Trim()
-Update-RaulManualPort -ManualFolder $ManualFolder -Port $port
-Update-FirewallForPort -Port $port
-Update-StartupBat -DashFolder $DashFolder -ManualFolder $ManualFolder -Port $port
+if ($changePort) {
+    Update-RaulManualPort -ManualFolder $ManualFolder -Port $port
+    Update-FirewallForPort -Port $port
+    Update-StartupBat -DashFolder $DashFolder -ManualFolder $ManualFolder -Port $port
+}
+else {
+    Write-Info "Port left unchanged."
+}
 
 Write-Host ""
 Write-Host "======================================" -ForegroundColor Cyan
